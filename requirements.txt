@@ -1,0 +1,30 @@
+# Dependencies pour FACS Autogating Pipeline
+# Installation: pip install -r requirements.txt
+
+# Interface Web
+streamlit>=1.28.0
+
+# Core libraries
+flowkit>=1.1.0
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Machine Learning
+scikit-learn>=1.3.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Excel export
+openpyxl>=3.1.0
+
+# Optional but recommended
+plotly>=5.17.0  # Pour visualisations interactives
+umap-learn>=0.5.4  # Pour dimensionality reduction avancée
+hdbscan>=0.8.33  # Pour clustering avancé
+
+# Alternative: FlowJo-like tools (optionnel)
+# flowio>=1.0.0
+# flowutils>=1.0.0
