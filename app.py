@@ -58,24 +58,27 @@ class SimpleFCSReader:
     
     def load_data(self):
         """Charge les données FCS en DataFrame"""
-        import numpy as np
-    
         # Récupérer les données brutes
         events = self.flow_data.events
-    
-        # Convertir en numpy array si nécessaire
+        n_channels = self.flow_data.channel_count
+        
+        # Convertir en numpy array
         if not isinstance(events, np.ndarray):
             events = np.array(events, dtype=np.float64)
-    
+        
+        # Reshape en (n_events, n_channels) si nécessaire
+        if events.ndim == 1:
+            n_events = len(events) // n_channels
+            events = events.reshape(n_events, n_channels)
+        
         # Récupérer les noms de canaux
         pnn_labels = []
-        for i in range(1, self.flow_data.channel_count + 1):
+        for i in range(1, n_channels + 1):
             pnn = self.flow_data.text.get(f'$P{i}N', f'Channel_{i}')
             pnn_labels.append(pnn)
-    
+        
         self.channels = pnn_labels
         self.data = pd.DataFrame(events, columns=self.channels)
-    
         return self.data
     
     def get_info(self):
