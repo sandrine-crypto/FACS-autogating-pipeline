@@ -57,20 +57,26 @@ class SimpleFCSReader:
         self.load_data()
     
     def load_data(self):
-        """Charge les données FCS en DataFrame"""
-        # Récupérer les données brutes
-        events = self.flow_data.events
-        
-        # Récupérer les noms de canaux
-        pnn_labels = []
-        for i in range(1, self.flow_data.channel_count + 1):
-            pnn = self.flow_data.text.get(f'$P{i}N', f'Channel_{i}')
-            pnn_labels.append(pnn)
-        
-        self.channels = pnn_labels
-        self.data = pd.DataFrame(events, columns=self.channels)
-        
-        return self.data
+    """Charge les données FCS en DataFrame"""
+    import numpy as np
+    
+    # Récupérer les données brutes
+    events = self.flow_data.events
+    
+    # Convertir en numpy array si nécessaire
+    if not isinstance(events, np.ndarray):
+        events = np.array(events, dtype=np.float64)
+    
+    # Récupérer les noms de canaux
+    pnn_labels = []
+    for i in range(1, self.flow_data.channel_count + 1):
+        pnn = self.flow_data.text.get(f'$P{i}N', f'Channel_{i}')
+        pnn_labels.append(pnn)
+    
+    self.channels = pnn_labels
+    self.data = pd.DataFrame(events, columns=self.channels)
+    
+    return self.data
     
     def get_info(self):
         """Retourne les informations du fichier"""
