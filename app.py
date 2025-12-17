@@ -199,11 +199,18 @@ def create_publication_plot(data, x_channel, y_channel, gates,
         colors = ['red', 'green', 'blue', 'orange', 'purple', 'cyan']
         for idx, (gate_name, mask) in enumerate(gates.items()):
             color = colors[idx % len(colors)]
-            # Convertir mask en numpy array et appliquer valid_mask
-            mask_array = mask.values if hasattr(mask, 'values') else np.array(mask)
-            mask_valid = mask_array[valid_mask]
             
-            if mask_valid.sum() > 0:
+            # Convertir mask en numpy array boolean
+            if hasattr(mask, 'values'):
+                mask_array = mask.values.astype(bool)
+            else:
+                mask_array = np.array(mask, dtype=bool)
+            
+            # Appliquer valid_mask pour obtenir le sous-ensemble
+            mask_valid = mask_array[valid_mask].astype(bool)
+            
+            n_gated = int(mask_valid.sum())
+            if n_gated > 0:
                 x_gated = x_data[mask_valid]
                 y_gated = y_data[mask_valid]
                 
