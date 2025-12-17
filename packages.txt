@@ -1,0 +1,7 @@
+# System packages for Streamlit Cloud
+# These are installed via apt-get
+
+# Required for scientific computing
+build-essential
+libatlas-base-dev
+gfortran
