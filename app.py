@@ -199,7 +199,9 @@ def create_publication_plot(data, x_channel, y_channel, gates,
         colors = ['red', 'green', 'blue', 'orange', 'purple', 'cyan']
         for idx, (gate_name, mask) in enumerate(gates.items()):
             color = colors[idx % len(colors)]
-            mask_valid = mask[valid_mask]
+            # Convertir mask en numpy array et appliquer valid_mask
+            mask_array = mask.values if hasattr(mask, 'values') else np.array(mask)
+            mask_valid = mask_array[valid_mask]
             
             if mask_valid.sum() > 0:
                 x_gated = x_data[mask_valid]
