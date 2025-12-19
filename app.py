@@ -358,6 +358,54 @@ n_learned = learned.get('n_corrections', 0)
 if n_learned > 0:
     st.success(f"🧠 {n_learned} correction(s) apprises")
 
+# Gestion de l'apprentissage
+with st.expander("🧠 Gérer l'apprentissage", expanded=False):
+    if n_learned == 0:
+        st.info("Aucune correction enregistrée")
+    else:
+        st.markdown("**Corrections par gate:**")
+        
+        params = load_learned_params()
+        gates_learned = params.get('gates', {})
+        
+        if gates_learned:
+            for gate_name, gate_data in gates_learned.items():
+                n_samples = gate_data.get('n_samples', 0)
+                adj = gate_data.get('avg_adjustment', {'x': 0, 'y': 0})
+                
+                col1, col2, col3 = st.columns([2, 2, 1])
+                with col1:
+                    st.write(f"**{gate_name}**: {n_samples} correction(s)")
+                with col2:
+                    st.caption(f"Δx={adj['x']:.1f}, Δy={adj['y']:.1f}")
+                with col3:
+                    if st.button("🗑️", key=f"del_{gate_name}", help=f"Supprimer {gate_name}"):
+                        del params['gates'][gate_name]
+                        params['n_corrections'] = max(0, params['n_corrections'] - n_samples)
+                        save_learned_params(params)
+                        st.rerun()
+        
+        st.markdown("---")
+        
+        col_reset1, col_reset2 = st.columns(2)
+        with col_reset1:
+            if st.button("🗑️ Supprimer TOUT l'apprentissage", type="secondary", use_container_width=True):
+                st.session_state.confirm_delete = True
+        
+        if st.session_state.get('confirm_delete', False):
+            st.warning("⚠️ Êtes-vous sûr ? Cette action est irréversible.")
+            col_confirm1, col_confirm2 = st.columns(2)
+            with col_confirm1:
+                if st.button("✅ Oui, supprimer", type="primary", use_container_width=True):
+                    save_learned_params({'n_corrections': 0, 'gates': {}})
+                    st.session_state.confirm_delete = False
+                    st.success("✅ Apprentissage réinitialisé")
+                    st.rerun()
+            with col_confirm2:
+                if st.button("❌ Annuler", use_container_width=True):
+                    st.session_state.confirm_delete = False
+                    st.rerun()
+
 # Session state
 if 'reader' not in st.session_state:
     st.session_state.reader = None
