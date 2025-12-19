@@ -145,21 +145,17 @@ def create_interactive_plot(data, x_channel, y_channel, x_marker, y_marker,
     # Créer la figure
     fig = go.Figure()
     
-    # Ajouter le scatter plot (density-like avec histogram2dcontour)
-    fig.add_trace(go.Histogram2dContour(
-        x=x_plot_display, y=y_plot_display,
-        colorscale='Jet',
-        showscale=False,
-        contours=dict(showlines=False),
-        ncontours=20,
-        name='Density'
-    ))
-    
-    # Ajouter les points en overlay
+    # Ajouter les points (scatter plot style FlowJo)
     fig.add_trace(go.Scattergl(
         x=x_plot_display, y=y_plot_display,
         mode='markers',
-        marker=dict(size=2, color='rgba(0,0,100,0.3)'),
+        marker=dict(
+            size=3,
+            color=y_plot_display,  # Colorer par densité Y
+            colorscale='Jet',
+            opacity=0.6,
+            showscale=False
+        ),
         name='Events',
         hoverinfo='skip'
     ))
@@ -269,6 +265,26 @@ def create_interactive_plot(data, x_channel, y_channel, x_marker, y_marker,
         height=400,
         dragmode='pan',
         margin=dict(l=60, r=20, t=60, b=60),
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        xaxis=dict(
+            showgrid=True,
+            gridcolor='lightgray',
+            gridwidth=1,
+            zeroline=False,
+            showline=True,
+            linecolor='black',
+            linewidth=1
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor='lightgray',
+            gridwidth=1,
+            zeroline=False,
+            showline=True,
+            linecolor='black',
+            linewidth=1
+        )
     )
     
     # Permettre l'édition des shapes
