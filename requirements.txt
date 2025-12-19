@@ -10,6 +10,6 @@ scikit-learn>=1.3.0
 scipy>=1.10.0
 openpyxl>=3.1.0
 plotly
-
+streamlit-plotly-events
 # FlowIO pour lecture FCS (plus léger que FlowKit)
 flowio>=1.2.0
