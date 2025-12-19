@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-FACS Autogating - Gates Hexagonaux avec Édition Directe sur Graphique
+FACS Autogating - Gates Hexagonaux avec Édition Directe
 - Gates hexagonaux (6 sommets)
-- Cliquer sur un sommet pour le sélectionner, puis cliquer sur la nouvelle position
+- Modification des coordonnées de chaque sommet
 - Mise à jour en cascade de toutes les populations
 - Auto-gating GMM + apprentissage
 """
@@ -11,18 +11,15 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from streamlit_plotly_events import plotly_events
 from sklearn.mixture import GaussianMixture
-from scipy.spatial import ConvexHull
 from pathlib import Path
 import tempfile
 import io
 import json
 import os
-from datetime import datetime
 import flowio
 
-st.set_page_config(page_title="FACS - Hexagones Interactifs", page_icon="🔬", layout="wide")
+st.set_page_config(page_title="FACS - Hexagones", page_icon="🔬", layout="wide")
 
 LEARNED_PARAMS_FILE = "learned_gating_params.json"
 
@@ -30,9 +27,6 @@ st.markdown("""
 <style>
 .main-header { font-size: 1.8rem; color: #2c3e50; text-align: center; margin-bottom: 0.5rem; }
 .info-box { background: #e7f3ff; padding: 0.8rem; border-radius: 0.5rem; border-left: 4px solid #0066cc; margin: 0.5rem 0; }
-.selected-info { background: #d4edda; padding: 0.5rem; border-radius: 0.3rem; border: 1px solid #28a745; margin: 0.3rem 0; }
-.warning-info { background: #fff3cd; padding: 0.5rem; border-radius: 0.3rem; border: 1px solid #ffc107; margin: 0.3rem 0; }
-.stats-card { background: #f8f9fa; padding: 0.8rem; border-radius: 0.5rem; border: 1px solid #dee2e6; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -98,9 +92,9 @@ def biex(x):
 
 
 def create_hexagon(center_x, center_y, radius_x, radius_y):
-    """Crée un hexagone régulier"""
-    angles = np.linspace(0, 2 * np.pi, 7)[:-1]  # 6 points
-    return [(center_x + radius_x * np.cos(a), center_y + radius_y * np.sin(a)) for a in angles]
+    """Crée un hexagone régulier avec 6 sommets"""
+    angles = np.linspace(0, 2 * np.pi, 7)[:-1]
+    return [(float(center_x + radius_x * np.cos(a)), float(center_y + radius_y * np.sin(a))) for a in angles]
 
 
 def point_in_polygon(x, y, polygon):
@@ -120,15 +114,24 @@ def point_in_polygon(x, y, polygon):
 
 
 def apply_gate(data, x_ch, y_ch, polygon, parent_mask=None):
+    """Applique un gate polygonal et retourne le masque"""
     if x_ch is None or y_ch is None or polygon is None or len(polygon) < 3:
         return pd.Series(False, index=data.index)
-    base = parent_mask.values if parent_mask is not None else np.ones(len(data), dtype=bool)
+    
+    if parent_mask is not None:
+        base = parent_mask.values
+    else:
+        base = np.ones(len(data), dtype=bool)
+    
     x, y = data[x_ch].values, data[y_ch].values
     valid = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0) & base
+    
     if not valid.any():
         return pd.Series(False, index=data.index)
+    
     xt, yt = biex(x), biex(y)
     in_poly = point_in_polygon(xt, yt, polygon)
+    
     result = np.zeros(len(data), dtype=bool)
     result[valid & in_poly] = True
     return pd.Series(result, index=data.index)
@@ -138,19 +141,29 @@ def auto_gate_gmm_hexagon(data, x_ch, y_ch, parent_mask=None, n_comp=2, mode='ma
     """Auto-gating avec GMM, retourne un hexagone"""
     if x_ch is None or y_ch is None:
         return None
-    subset = data[parent_mask] if parent_mask is not None and parent_mask.sum() > 0 else data
+    
+    if parent_mask is not None and parent_mask.sum() > 0:
+        subset = data[parent_mask]
+    else:
+        subset = data
+    
     if len(subset) < 100:
         return None
+    
     x, y = subset[x_ch].values, subset[y_ch].values
     valid = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+    
     if valid.sum() < 100:
         return None
+    
     xt, yt = biex(x[valid]), biex(y[valid])
     X = np.column_stack([xt, yt])
+    
     try:
         gmm = GaussianMixture(n_components=n_comp, covariance_type='full', random_state=42, n_init=3)
         gmm.fit(X)
         labels = gmm.predict(X)
+        
         if mode == 'main':
             target = np.argmax([np.sum(labels == i) for i in range(n_comp)])
         elif mode == 'low_x':
@@ -161,20 +174,24 @@ def auto_gate_gmm_hexagon(data, x_ch, y_ch, parent_mask=None, n_comp=2, mode='ma
             target = np.argmax([np.mean(xt[labels == i]) - np.mean(yt[labels == i]) for i in range(n_comp)])
         else:
             target = 0
+        
         mask = labels == target
         cx, cy = xt[mask], yt[mask]
+        
         if len(cx) < 30:
             return None
-        # Créer hexagone centré sur le cluster
+        
         center_x, center_y = np.median(cx), np.median(cy)
         radius_x = np.percentile(np.abs(cx - center_x), 90) * 1.2
         radius_y = np.percentile(np.abs(cy - center_y), 90) * 1.2
+        
         return create_hexagon(center_x, center_y, radius_x, radius_y)
-    except:
+    except Exception as e:
         return None
 
 
 def apply_learned_adj(polygon, gate_name):
+    """Applique les ajustements appris"""
     if polygon is None:
         return None
     params = load_learned_params()
@@ -185,42 +202,31 @@ def apply_learned_adj(polygon, gate_name):
     return polygon
 
 
-def find_closest_point(polygon, click_x, click_y, threshold=15):
-    """Trouve le point le plus proche du clic"""
-    if polygon is None:
-        return None
-    min_dist = float('inf')
-    closest_idx = None
-    for i, (px, py) in enumerate(polygon):
-        dist = np.sqrt((px - click_x)**2 + (py - click_y)**2)
-        if dist < min_dist and dist < threshold:
-            min_dist = dist
-            closest_idx = i
-    return closest_idx
-
-
-def create_interactive_hexagon_plot(data, x_ch, y_ch, x_label, y_label, title, 
-                                     polygon, parent_mask, gate_name, selected_point=None):
-    """Crée un graphique Plotly avec hexagone et points cliquables"""
+def create_plot(data, x_ch, y_ch, x_label, y_label, title, polygon, parent_mask, gate_name):
+    """Crée un graphique Plotly avec hexagone"""
     
     if x_ch is None or y_ch is None:
         fig = go.Figure()
         fig.add_annotation(text="Canal non trouvé", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
-        return fig, 0, 0
+        return fig, 0, 0.0
     
-    subset = data[parent_mask] if parent_mask is not None and parent_mask.sum() > 0 else data
+    if parent_mask is not None and parent_mask.sum() > 0:
+        subset = data[parent_mask]
+    else:
+        subset = data
+    
     n_parent = len(subset)
     
     if n_parent == 0:
         fig = go.Figure()
         fig.add_annotation(text="Pas de données", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
-        return fig, 0, 0
+        return fig, 0, 0.0
     
     x, y = subset[x_ch].values, subset[y_ch].values
     valid = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
     xt, yt = biex(x[valid]), biex(y[valid])
     
-    # Sous-échantillonner
+    # Sous-échantillonner pour l'affichage
     if len(xt) > 6000:
         idx = np.random.choice(len(xt), 6000, replace=False)
         xd, yd = xt[idx], yt[idx]
@@ -229,7 +235,7 @@ def create_interactive_hexagon_plot(data, x_ch, y_ch, x_label, y_label, title,
     
     fig = go.Figure()
     
-    # Scatter plot des données
+    # Scatter plot
     fig.add_trace(go.Scattergl(
         x=xd, y=yd,
         mode='markers',
@@ -238,18 +244,19 @@ def create_interactive_hexagon_plot(data, x_ch, y_ch, x_label, y_label, title,
         name='Data'
     ))
     
-    n_in, pct = 0, 0
+    n_in, pct = 0, 0.0
     
     if polygon and len(polygon) >= 3:
-        # Calculer stats
+        # Calculer les stats sur TOUTES les données, pas le sous-échantillon
         full_mask = apply_gate(data, x_ch, y_ch, polygon, parent_mask)
-        n_in = full_mask.sum()
-        pct = n_in / n_parent * 100 if n_parent > 0 else 0
+        n_in = int(full_mask.sum())
+        pct = float(n_in / n_parent * 100) if n_parent > 0 else 0.0
         
-        # Hexagone - remplissage
+        # Dessiner l'hexagone
         px = [p[0] for p in polygon] + [polygon[0][0]]
         py = [p[1] for p in polygon] + [polygon[0][1]]
         
+        # Remplissage
         fig.add_trace(go.Scatter(
             x=px, y=py,
             fill='toself',
@@ -260,29 +267,17 @@ def create_interactive_hexagon_plot(data, x_ch, y_ch, x_label, y_label, title,
             hoverinfo='skip'
         ))
         
-        # Points de contrôle (sommets de l'hexagone)
-        point_colors = ['red'] * len(polygon)
-        point_sizes = [14] * len(polygon)
-        if selected_point is not None and selected_point < len(polygon):
-            point_colors[selected_point] = 'lime'
-            point_sizes[selected_point] = 20
-        
+        # Points numérotés (sommets)
         fig.add_trace(go.Scatter(
             x=[p[0] for p in polygon],
             y=[p[1] for p in polygon],
             mode='markers+text',
-            marker=dict(
-                size=point_sizes, 
-                color=point_colors, 
-                symbol='circle',
-                line=dict(color='darkred', width=2)
-            ),
+            marker=dict(size=14, color='red', symbol='circle', line=dict(color='darkred', width=2)),
             text=[str(i+1) for i in range(len(polygon))],
             textposition='top center',
             textfont=dict(size=11, color='darkred', family='Arial Black'),
             name='Sommets',
-            hovertemplate='<b>Point %{text}</b><br>X: %{x:.1f}<br>Y: %{y:.1f}<br><i>Cliquez pour sélectionner</i><extra></extra>',
-            customdata=list(range(len(polygon)))
+            hovertemplate='Point %{text}<br>X: %{x:.1f}<br>Y: %{y:.1f}<extra></extra>'
         ))
         
         # Annotation centrale
@@ -303,13 +298,12 @@ def create_interactive_hexagon_plot(data, x_ch, y_ch, x_label, y_label, title,
         xaxis_title=x_label,
         yaxis_title=y_label,
         showlegend=False,
-        height=400,
+        height=380,
         margin=dict(l=50, r=20, t=60, b=50),
         plot_bgcolor='white',
         paper_bgcolor='white',
         xaxis=dict(showgrid=True, gridcolor='#f0f0f0', zeroline=False, showline=True, linecolor='#ccc'),
         yaxis=dict(showgrid=True, gridcolor='#f0f0f0', zeroline=False, showline=True, linecolor='#ccc'),
-        dragmode='pan'
     )
     
     return fig, n_in, pct
@@ -325,10 +319,11 @@ def scale_polygon(polygon, factor):
     if polygon is None:
         return None
     center = np.mean(polygon, axis=0)
-    return [(center[0] + factor * (p[0] - center[0]), center[1] + factor * (p[1] - center[1])) for p in polygon]
+    return [(float(center[0] + factor * (p[0] - center[0])), float(center[1] + factor * (p[1] - center[1]))) for p in polygon]
 
 
-# ===== MAIN =====
+# ==================== MAIN ====================
+
 st.markdown('<h1 class="main-header">🔬 FACS - Hexagones Interactifs</h1>', unsafe_allow_html=True)
 
 learned = load_learned_params()
@@ -336,27 +331,30 @@ n_learned = learned.get('n_corrections', 0)
 if n_learned > 0:
     st.info(f"🧠 {n_learned} correction(s) apprises")
 
-# Session state
-for key in ['reader', 'data', 'channels', 'polygons', 'original_polygons', 'auto_done']:
-    if key not in st.session_state:
-        st.session_state[key] = {} if 'polygon' in key or key == 'channels' else None
-
-if st.session_state.get('auto_done') is None:
+# Initialisation session state
+if 'reader' not in st.session_state:
+    st.session_state.reader = None
+if 'data' not in st.session_state:
+    st.session_state.data = None
+if 'channels' not in st.session_state:
+    st.session_state.channels = {}
+if 'polygons' not in st.session_state:
+    st.session_state.polygons = {}
+if 'original_polygons' not in st.session_state:
+    st.session_state.original_polygons = {}
+if 'auto_done' not in st.session_state:
     st.session_state.auto_done = False
 
-# État de sélection pour l'édition
-if 'selected_gate' not in st.session_state:
-    st.session_state.selected_gate = None
-if 'selected_point_idx' not in st.session_state:
-    st.session_state.selected_point_idx = None
-
+# Upload fichier
 uploaded = st.file_uploader("📁 Fichier FCS", type=['fcs'])
 
 if uploaded:
+    # Charger si nouveau fichier
     if st.session_state.reader is None or st.session_state.get('fname') != uploaded.name:
         with tempfile.NamedTemporaryFile(delete=False, suffix='.fcs') as tmp:
             tmp.write(uploaded.read())
             tmp_path = tmp.name
+        
         with st.spinner("Chargement..."):
             reader = FCSReader(tmp_path)
             st.session_state.reader = reader
@@ -365,8 +363,7 @@ if uploaded:
             st.session_state.polygons = {}
             st.session_state.original_polygons = {}
             st.session_state.auto_done = False
-            st.session_state.selected_gate = None
-            st.session_state.selected_point_idx = None
+            
             cols = reader.data.columns
             st.session_state.channels = {
                 'FSC-A': find_channel(cols, ['FSC-A', 'FSC']),
@@ -385,6 +382,7 @@ if uploaded:
     ch = st.session_state.channels
     n_total = len(data)
     
+    # Métriques
     c1, c2, c3 = st.columns(3)
     c1.metric("Événements", f"{n_total:,}")
     c2.metric("Canaux", len(reader.channels))
@@ -400,19 +398,20 @@ if uploaded:
     
     st.markdown("---")
     
-    # AUTO-GATING
+    # ==================== AUTO-GATING ====================
+    
     if not st.session_state.auto_done:
         if st.button("🚀 LANCER L'AUTO-GATING", type="primary", use_container_width=True):
             prog = st.progress(0)
             
-            # Cells
+            # 1. Cells
             poly = auto_gate_gmm_hexagon(data, ch['FSC-A'], ch['SSC-A'], None, 2, 'main')
             poly = apply_learned_adj(poly, 'cells')
             st.session_state.polygons['cells'] = poly
             st.session_state.original_polygons['cells'] = list(poly) if poly else None
             prog.progress(25)
             
-            # Singlets
+            # 2. Singlets
             if ch['FSC-H']:
                 cells_m = apply_gate(data, ch['FSC-A'], ch['SSC-A'], poly, None)
                 poly = auto_gate_gmm_hexagon(data, ch['FSC-A'], ch['FSC-H'], cells_m, 2, 'main')
@@ -423,7 +422,7 @@ if uploaded:
             st.session_state.original_polygons['singlets'] = list(poly) if poly else None
             prog.progress(50)
             
-            # Live
+            # 3. Live
             if ch['LiveDead']:
                 cells_m = apply_gate(data, ch['FSC-A'], ch['SSC-A'], st.session_state.polygons['cells'], None)
                 sing_m = apply_gate(data, ch['FSC-A'], ch['FSC-H'], st.session_state.polygons['singlets'], cells_m) if st.session_state.polygons['singlets'] else cells_m
@@ -435,7 +434,7 @@ if uploaded:
             st.session_state.original_polygons['live'] = list(poly) if poly else None
             prog.progress(75)
             
-            # hCD45
+            # 4. hCD45+
             if ch['hCD45']:
                 cells_m = apply_gate(data, ch['FSC-A'], ch['SSC-A'], st.session_state.polygons['cells'], None)
                 sing_m = apply_gate(data, ch['FSC-A'], ch['FSC-H'], st.session_state.polygons['singlets'], cells_m) if st.session_state.polygons['singlets'] else cells_m
@@ -451,36 +450,12 @@ if uploaded:
             st.session_state.auto_done = True
             st.rerun()
     
-    # AFFICHAGE ET ÉDITION
+    # ==================== AFFICHAGE ====================
+    
     if st.session_state.auto_done:
         polygons = st.session_state.polygons
         
-        # Instructions
-        st.markdown("""
-        <div class="info-box">
-        <b>📌 Modification directe sur le graphique:</b><br>
-        1️⃣ <b>Cliquez sur un sommet</b> (point rouge) pour le sélectionner (devient vert)<br>
-        2️⃣ <b>Cliquez sur la nouvelle position</b> dans le graphique<br>
-        3️⃣ Les statistiques se mettent à jour automatiquement
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Afficher le point sélectionné
-        if st.session_state.selected_gate and st.session_state.selected_point_idx is not None:
-            st.markdown(f"""
-            <div class="selected-info">
-            ✅ <b>Point sélectionné:</b> Gate <b>{st.session_state.selected_gate}</b>, 
-            Sommet <b>{st.session_state.selected_point_idx + 1}</b> — 
-            Cliquez sur la nouvelle position ou sélectionnez un autre point
-            </div>
-            """, unsafe_allow_html=True)
-            
-            if st.button("❌ Désélectionner", key="deselect"):
-                st.session_state.selected_gate = None
-                st.session_state.selected_point_idx = None
-                st.rerun()
-        
-        # Recalcul des masques (cascade complète)
+        # Recalcul des masques en cascade
         cells_m = apply_gate(data, ch['FSC-A'], ch['SSC-A'], polygons.get('cells'), None)
         sing_m = apply_gate(data, ch['FSC-A'], ch['FSC-H'], polygons.get('singlets'), cells_m) if polygons.get('singlets') else cells_m
         live_m = apply_gate(data, ch['LiveDead'], ch['SSC-A'], polygons.get('live'), sing_m) if polygons.get('live') else sing_m
@@ -496,7 +471,7 @@ if uploaded:
         
         stats = []
         
-        # Affichage en 2x2
+        # Affichage grille 2x2
         for row in range(2):
             cols_display = st.columns(2)
             for col_idx in range(2):
@@ -512,71 +487,65 @@ if uploaded:
                 with cols_display[col_idx]:
                     st.markdown(f"#### {gate_idx + 1}️⃣ {gname}")
                     
-                    # Déterminer si ce gate a un point sélectionné
-                    selected_pt = None
-                    if st.session_state.selected_gate == gkey:
-                        selected_pt = st.session_state.selected_point_idx
-                    
-                    # Créer le graphique
-                    fig, n_in, pct = create_interactive_hexagon_plot(
+                    # Graphique
+                    fig, n_in, pct = create_plot(
                         data, x_ch, y_ch, x_label, y_label, title,
-                        polygons.get(gkey), parent_mask, gname, selected_pt
+                        polygons.get(gkey), parent_mask, gname
                     )
+                    st.plotly_chart(fig, use_container_width=True, key=f"plot_{gkey}")
                     
-                    # Afficher avec capture des clics
-                    clicked = plotly_events(fig, click_event=True, key=f"plot_{gkey}")
+                    parent_name = title.split('→')[0].strip() if '→' in title else 'Ungated'
+                    stats.append((gname, parent_name, n_in, pct))
                     
-                    stats.append((gname, title.split('→')[0].strip() if '→' in title else 'Ungated', n_in, pct))
-                    
-                    # Traiter les clics
-                    if clicked and len(clicked) > 0:
-                        click_x = clicked[0].get('x')
-                        click_y = clicked[0].get('y')
-                        
-                        if click_x is not None and click_y is not None:
-                            poly = polygons.get(gkey)
+                    # Contrôles d'édition
+                    poly = polygons.get(gkey)
+                    if poly:
+                        with st.expander(f"✏️ Modifier {gname}", expanded=False):
+                            # Sélection du point
+                            col_sel, col_coords = st.columns([1, 2])
+                            with col_sel:
+                                pt_idx = st.selectbox(
+                                    "Point", 
+                                    range(len(poly)),
+                                    format_func=lambda x: f"Point {x+1}",
+                                    key=f"pt_{gkey}"
+                                )
+                            with col_coords:
+                                st.caption(f"Actuel: ({poly[pt_idx][0]:.1f}, {poly[pt_idx][1]:.1f})")
                             
-                            # Vérifier si on clique sur un sommet
-                            closest_pt = find_closest_point(poly, click_x, click_y, threshold=20)
+                            # Nouvelles coordonnées
+                            col_x, col_y = st.columns(2)
+                            with col_x:
+                                new_x = st.number_input("X", value=float(poly[pt_idx][0]), step=1.0, key=f"x_{gkey}")
+                            with col_y:
+                                new_y = st.number_input("Y", value=float(poly[pt_idx][1]), step=1.0, key=f"y_{gkey}")
                             
-                            if closest_pt is not None:
-                                # Sélection d'un point
-                                st.session_state.selected_gate = gkey
-                                st.session_state.selected_point_idx = closest_pt
-                                st.rerun()
-                            elif st.session_state.selected_gate == gkey and st.session_state.selected_point_idx is not None:
-                                # Déplacer le point sélectionné
-                                pt_idx = st.session_state.selected_point_idx
+                            if st.button("✅ Appliquer", key=f"apply_{gkey}", use_container_width=True):
                                 new_poly = list(poly)
-                                new_poly[pt_idx] = (click_x, click_y)
+                                new_poly[pt_idx] = (new_x, new_y)
                                 st.session_state.polygons[gkey] = new_poly
-                                # Désélectionner après déplacement
-                                st.session_state.selected_gate = None
-                                st.session_state.selected_point_idx = None
                                 st.rerun()
-                    
-                    # Boutons de contrôle rapide
-                    with st.expander("🎛️ Contrôles", expanded=False):
-                        poly = polygons.get(gkey)
-                        if poly:
-                            move_step = st.slider("Pas", 1, 20, 5, key=f"step_{gkey}")
+                            
+                            st.markdown("---")
+                            st.markdown("**Déplacer tout:**")
+                            step = st.slider("Pas", 1, 20, 5, key=f"step_{gkey}")
                             
                             c1, c2, c3, c4 = st.columns(4)
                             with c1:
                                 if st.button("⬆️", key=f"up_{gkey}"):
-                                    st.session_state.polygons[gkey] = move_polygon(poly, 0, move_step)
+                                    st.session_state.polygons[gkey] = move_polygon(poly, 0, step)
                                     st.rerun()
                             with c2:
                                 if st.button("⬇️", key=f"dn_{gkey}"):
-                                    st.session_state.polygons[gkey] = move_polygon(poly, 0, -move_step)
+                                    st.session_state.polygons[gkey] = move_polygon(poly, 0, -step)
                                     st.rerun()
                             with c3:
                                 if st.button("⬅️", key=f"lt_{gkey}"):
-                                    st.session_state.polygons[gkey] = move_polygon(poly, -move_step, 0)
+                                    st.session_state.polygons[gkey] = move_polygon(poly, -step, 0)
                                     st.rerun()
                             with c4:
                                 if st.button("➡️", key=f"rt_{gkey}"):
-                                    st.session_state.polygons[gkey] = move_polygon(poly, move_step, 0)
+                                    st.session_state.polygons[gkey] = move_polygon(poly, step, 0)
                                     st.rerun()
                             
                             c5, c6 = st.columns(2)
@@ -598,7 +567,8 @@ if uploaded:
             if st.button("💾 Sauvegarder (apprentissage)", type="primary", use_container_width=True):
                 n_saved = 0
                 for gname in polygons:
-                    curr, orig = polygons.get(gname), st.session_state.original_polygons.get(gname)
+                    curr = polygons.get(gname)
+                    orig = st.session_state.original_polygons.get(gname)
                     if curr and orig and list(curr) != list(orig):
                         update_learned_params(gname, orig, curr)
                         n_saved += 1
@@ -610,8 +580,6 @@ if uploaded:
         with col_b:
             if st.button("🔃 Réinitialiser tout", use_container_width=True):
                 st.session_state.polygons = {k: list(v) if v else None for k, v in st.session_state.original_polygons.items()}
-                st.session_state.selected_gate = None
-                st.session_state.selected_point_idx = None
                 st.rerun()
         
         with col_c:
@@ -623,12 +591,12 @@ if uploaded:
         df = pd.DataFrame(stats, columns=['Population', 'Parent', 'Count', '% Parent'])
         df['% Total'] = (df['Count'] / n_total * 100).round(2)
         df['% Parent'] = df['% Parent'].round(1)
-        
         st.dataframe(df, use_container_width=True, hide_index=True)
         
         # Export
         c1, c2 = st.columns(2)
         c1.download_button("📥 CSV", df.to_csv(index=False), f"{reader.filename}.csv", "text/csv", use_container_width=True)
+        
         buf = io.BytesIO()
         df.to_excel(buf, index=False, engine='openpyxl')
         buf.seek(0)
@@ -641,7 +609,7 @@ else:
     <p><b>Fonctionnalités:</b></p>
     <ul>
     <li>Gates en <b>hexagones</b> (6 sommets)</li>
-    <li>Modification <b>directe sur le graphique</b> par clic</li>
+    <li>Modification <b>point par point</b></li>
     <li>Mise à jour <b>en cascade</b> de toutes les populations</li>
     <li>Apprentissage automatique des corrections</li>
     </ul>
@@ -649,4 +617,4 @@ else:
     </div>
     """, unsafe_allow_html=True)
 
-st.caption(f"🔬 FACS Hexagones Interactifs | 🧠 {n_learned} corrections apprises")
+st.caption(f"🔬 FACS Hexagones v2 | 🧠 {n_learned} corrections apprises")
