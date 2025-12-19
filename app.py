@@ -630,50 +630,50 @@ if uploaded:
 
             # 2. Singlets
             progress.progress(10, "Singlets...")
-            if ch['FSC-H']:
-                poly, _ = auto_gate_hexagon(data, ch['FSC-A'], ch['FSC-H'], masks['cells'], 'main')
+            if ch.get('FSC-H'):
+                poly, _ = auto_gate_hexagon(data, ch['FSC-A'], ch.get('FSC-H'), masks['cells'], 'main')
                 polygons['singlets'] = apply_learned_adj(poly, 'singlets')
-                masks['singlets'] = apply_gate(data, ch['FSC-A'], ch['FSC-H'], polygons['singlets'], masks['cells'])
+                masks['singlets'] = apply_gate(data, ch['FSC-A'], ch.get('FSC-H'), polygons['singlets'], masks['cells'])
             else:
                 masks['singlets'] = masks['cells']
 
             # 3. Live
             progress.progress(15, "Live...")
-            if ch['LiveDead']:
-                poly, _ = auto_gate_hexagon(data, ch['LiveDead'], ch['SSC-A'], masks['singlets'], 'low_x')
+            if ch.get('LiveDead'):
+                poly, _ = auto_gate_hexagon(data, ch.get('LiveDead'), ch['SSC-A'], masks['singlets'], 'low_x')
                 polygons['live'] = apply_learned_adj(poly, 'live')
-                masks['live'] = apply_gate(data, ch['LiveDead'], ch['SSC-A'], polygons['live'], masks['singlets'])
+                masks['live'] = apply_gate(data, ch.get('LiveDead'), ch['SSC-A'], polygons['live'], masks['singlets'])
             else:
                 masks['live'] = masks['singlets']
 
             # 4. Leucocytes (hCD45+)
             progress.progress(25, "Leucocytes...")
-            if ch['hCD45']:
-                poly, _ = auto_gate_hexagon(data, ch['hCD45'], ch['SSC-A'], masks['live'], 'high_x')
+            if ch.get('hCD45'):
+                poly, _ = auto_gate_hexagon(data, ch.get('hCD45'), ch['SSC-A'], masks['live'], 'high_x')
                 polygons['leucocytes'] = apply_learned_adj(poly, 'leucocytes')
-                masks['leucocytes'] = apply_gate(data, ch['hCD45'], ch['SSC-A'], polygons['leucocytes'], masks['live'])
+                masks['leucocytes'] = apply_gate(data, ch.get('hCD45'), ch['SSC-A'], polygons['leucocytes'], masks['live'])
             else:
                 masks['leucocytes'] = masks['live']
 
             # 5. T cells (CD3+)
             progress.progress(35, "T cells...")
-            if ch['CD3']:
-                poly, _ = auto_gate_hexagon(data, ch['CD3'], ch['SSC-A'], masks['leucocytes'], 'high_x')
+            if ch.get('CD3'):
+                poly, _ = auto_gate_hexagon(data, ch.get('CD3'), ch['SSC-A'], masks['leucocytes'], 'high_x')
                 polygons['tcells'] = apply_learned_adj(poly, 'tcells')
-                masks['tcells'] = apply_gate(data, ch['CD3'], ch['SSC-A'], polygons['tcells'], masks['leucocytes'])
+                masks['tcells'] = apply_gate(data, ch.get('CD3'), ch['SSC-A'], polygons['tcells'], masks['leucocytes'])
             else:
                 masks['tcells'] = masks['leucocytes']
 
             # 6. B cells (CD19+)
             progress.progress(45, "B cells...")
-            if ch['CD19']:
-                poly, _ = auto_gate_hexagon(data, ch['CD19'], ch['SSC-A'], masks['leucocytes'], 'high_x')
+            if ch.get('CD19'):
+                poly, _ = auto_gate_hexagon(data, ch.get('CD19'), ch['SSC-A'], masks['leucocytes'], 'high_x')
                 polygons['bcells'] = apply_learned_adj(poly, 'bcells')
-                masks['bcells'] = apply_gate(data, ch['CD19'], ch['SSC-A'], polygons['bcells'], masks['leucocytes'])
+                masks['bcells'] = apply_gate(data, ch.get('CD19'), ch['SSC-A'], polygons['bcells'], masks['leucocytes'])
 
             # 7. NK cells (CD56+ ou CD16+)
             progress.progress(55, "NK cells...")
-            nk_ch = ch['CD56'] or ch['CD16']
+            nk_ch = ch.get('CD56') or ch.get('CD16')
             if nk_ch:
                 poly, _ = auto_gate_hexagon(data, nk_ch, ch['SSC-A'], masks['leucocytes'], 'high_x')
                 polygons['nk'] = apply_learned_adj(poly, 'nk')
@@ -681,35 +681,35 @@ if uploaded:
 
             # 8. CD4+ T cells
             progress.progress(65, "CD4+ T cells...")
-            if ch['CD4']:
-                poly, _ = auto_gate_hexagon(data, ch['CD4'], ch['SSC-A'], masks['tcells'], 'high_x')
+            if ch.get('CD4'):
+                poly, _ = auto_gate_hexagon(data, ch.get('CD4'), ch['SSC-A'], masks['tcells'], 'high_x')
                 polygons['cd4'] = apply_learned_adj(poly, 'cd4')
-                masks['cd4'] = apply_gate(data, ch['CD4'], ch['SSC-A'], polygons['cd4'], masks['tcells'])
+                masks['cd4'] = apply_gate(data, ch.get('CD4'), ch['SSC-A'], polygons['cd4'], masks['tcells'])
 
             # 9. CD8+ T cells
             progress.progress(70, "CD8+ T cells...")
-            if ch['CD8']:
-                poly, _ = auto_gate_hexagon(data, ch['CD8'], ch['SSC-A'], masks['tcells'], 'high_x')
+            if ch.get('CD8'):
+                poly, _ = auto_gate_hexagon(data, ch.get('CD8'), ch['SSC-A'], masks['tcells'], 'high_x')
                 polygons['cd8'] = apply_learned_adj(poly, 'cd8')
-                masks['cd8'] = apply_gate(data, ch['CD8'], ch['SSC-A'], polygons['cd8'], masks['tcells'])
+                masks['cd8'] = apply_gate(data, ch.get('CD8'), ch['SSC-A'], polygons['cd8'], masks['tcells'])
 
             # 10. Daudi (cellules cibles)
             progress.progress(75, "Daudi...")
-            if ch['Daudi']:
-                poly, _ = auto_gate_hexagon(data, ch['Daudi'], ch['SSC-A'], masks['live'], 'high_x')
+            if ch.get('Daudi'):
+                poly, _ = auto_gate_hexagon(data, ch.get('Daudi'), ch['SSC-A'], masks['live'], 'high_x')
                 polygons['daudi'] = apply_learned_adj(poly, 'daudi')
-                masks['daudi'] = apply_gate(data, ch['Daudi'], ch['SSC-A'], polygons['daudi'], masks['live'])
+                masks['daudi'] = apply_gate(data, ch.get('Daudi'), ch['SSC-A'], polygons['daudi'], masks['live'])
 
             # Thresholds pour marqueurs
             progress.progress(85, "Calcul seuils marqueurs...")
-            if ch['hPDL1']:
-                thresholds['hPDL1'] = auto_find_threshold(data, ch['hPDL1'], masks.get('leucocytes'))
-            if ch['hPD1']:
-                thresholds['hPD1'] = auto_find_threshold(data, ch['hPD1'], masks.get('tcells'))
-            if ch['CD16']:
-                thresholds['hCD16'] = auto_find_threshold(data, ch['CD16'], masks.get('nk') or masks.get('leucocytes'))
-            if ch['GranzymeB']:
-                thresholds['GranzymeB'] = auto_find_threshold(data, ch['GranzymeB'], masks.get('nk') or masks.get('tcells'))
+            if ch.get('hPDL1'):
+                thresholds['hPDL1'] = auto_find_threshold(data, ch.get('hPDL1'), masks.get('leucocytes'))
+            if ch.get('hPD1'):
+                thresholds['hPD1'] = auto_find_threshold(data, ch.get('hPD1'), masks.get('tcells'))
+            if ch.get('CD16'):
+                thresholds['hCD16'] = auto_find_threshold(data, ch.get('CD16'), masks.get('nk') or masks.get('leucocytes'))
+            if ch.get('GranzymeB'):
+                thresholds['GranzymeB'] = auto_find_threshold(data, ch.get('GranzymeB'), masks.get('nk') or masks.get('tcells'))
 
             progress.progress(100, "Terminé!")
             st.session_state.auto_done = True
@@ -723,10 +723,10 @@ if uploaded:
 
         # Recalcul des masques
         masks['cells'] = apply_gate(data, ch['FSC-A'], ch['SSC-A'], polygons.get('cells'), None)
-        masks['singlets'] = apply_gate(data, ch['FSC-A'], ch['FSC-H'], polygons.get('singlets'), masks['cells']) if ch['FSC-H'] else masks['cells']
-        masks['live'] = apply_gate(data, ch['LiveDead'], ch['SSC-A'], polygons.get('live'), masks['singlets']) if ch['LiveDead'] else masks['singlets']
-        masks['leucocytes'] = apply_gate(data, ch['hCD45'], ch['SSC-A'], polygons.get('leucocytes'), masks['live']) if ch['hCD45'] else masks['live']
-        masks['tcells'] = apply_gate(data, ch['CD3'], ch['SSC-A'], polygons.get('tcells'), masks['leucocytes']) if ch['CD3'] else masks['leucocytes']
+        masks['singlets'] = apply_gate(data, ch['FSC-A'], ch.get('FSC-H'), polygons.get('singlets'), masks['cells']) if ch.get('FSC-H') else masks['cells']
+        masks['live'] = apply_gate(data, ch.get('LiveDead'), ch['SSC-A'], polygons.get('live'), masks['singlets']) if ch.get('LiveDead') else masks['singlets']
+        masks['leucocytes'] = apply_gate(data, ch.get('hCD45'), ch['SSC-A'], polygons.get('leucocytes'), masks['live']) if ch.get('hCD45') else masks['live']
+        masks['tcells'] = apply_gate(data, ch.get('CD3'), ch['SSC-A'], polygons.get('tcells'), masks['leucocytes']) if ch.get('CD3') else masks['leucocytes']
 
         # Tabs
         tab1, tab2, tab3, tab4 = st.tabs(["📊 Hiérarchie", "🧬 Populations", "💊 Marqueurs", "📥 Export"])
@@ -746,14 +746,14 @@ if uploaded:
 
             with cols[1]:
                 fig, n, pct, _ = create_flowjo_plot(
-                    data, ch['FSC-A'], ch['FSC-H'], 'FSC-A', 'FSC-H',
+                    data, ch['FSC-A'], ch.get('FSC-H'), 'FSC-A', 'FSC-H',
                     'Singlets', polygons.get('singlets'), masks['cells'], 'Singlets', plot_type
                 )
                 st.plotly_chart(fig, use_container_width=True, key='p_singlets')
 
             with cols[2]:
                 fig, n, pct, _ = create_flowjo_plot(
-                    data, ch['LiveDead'], ch['SSC-A'], 'Live/Dead', 'SSC-A',
+                    data, ch.get('LiveDead'), ch['SSC-A'], 'Live/Dead', 'SSC-A',
                     'Live', polygons.get('live'), masks['singlets'], 'Live', plot_type
                 )
                 st.plotly_chart(fig, use_container_width=True, key='p_live')
@@ -763,21 +763,21 @@ if uploaded:
 
             with cols2[0]:
                 fig, n, pct, _ = create_flowjo_plot(
-                    data, ch['hCD45'], ch['SSC-A'], 'hCD45', 'SSC-A',
+                    data, ch.get('hCD45'), ch['SSC-A'], 'hCD45', 'SSC-A',
                     'Leucocytes (hCD45+)', polygons.get('leucocytes'), masks['live'], 'Leucocytes', plot_type
                 )
                 st.plotly_chart(fig, use_container_width=True, key='p_leuco')
 
             with cols2[1]:
                 fig, n, pct, _ = create_flowjo_plot(
-                    data, ch['CD3'], ch['SSC-A'], 'CD3', 'SSC-A',
+                    data, ch.get('CD3'), ch['SSC-A'], 'CD3', 'SSC-A',
                     'T cells (CD3+)', polygons.get('tcells'), masks['leucocytes'], 'T cells', plot_type
                 )
                 st.plotly_chart(fig, use_container_width=True, key='p_tcells')
 
             with cols2[2]:
                 fig, n, pct, _ = create_flowjo_plot(
-                    data, ch['CD19'], ch['SSC-A'], 'CD19', 'SSC-A',
+                    data, ch.get('CD19'), ch['SSC-A'], 'CD19', 'SSC-A',
                     'B cells (CD19+)', polygons.get('bcells'), masks['leucocytes'], 'B cells', plot_type
                 )
                 st.plotly_chart(fig, use_container_width=True, key='p_bcells')
@@ -789,7 +789,7 @@ if uploaded:
 
             # NK cells
             with cols[0]:
-                nk_ch = ch['CD56'] or ch['CD16']
+                nk_ch = ch.get('CD56') or ch.get('CD16')
                 if nk_ch:
                     fig, n, pct, _ = create_flowjo_plot(
                         data, nk_ch, ch['SSC-A'], 'CD56/CD16', 'SSC-A',
@@ -799,18 +799,18 @@ if uploaded:
 
             # CD4+ T cells
             with cols[1]:
-                if ch['CD4']:
+                if ch.get('CD4'):
                     fig, n, pct, _ = create_flowjo_plot(
-                        data, ch['CD4'], ch['SSC-A'], 'CD4', 'SSC-A',
+                        data, ch.get('CD4'), ch['SSC-A'], 'CD4', 'SSC-A',
                         'CD4+ T cells', polygons.get('cd4'), masks['tcells'], 'CD4+', plot_type
                     )
                     st.plotly_chart(fig, use_container_width=True, key='p_cd4')
 
             # CD8+ T cells
             with cols[2]:
-                if ch['CD8']:
+                if ch.get('CD8'):
                     fig, n, pct, _ = create_flowjo_plot(
-                        data, ch['CD8'], ch['SSC-A'], 'CD8', 'SSC-A',
+                        data, ch.get('CD8'), ch['SSC-A'], 'CD8', 'SSC-A',
                         'CD8+ T cells', polygons.get('cd8'), masks['tcells'], 'CD8+', plot_type
                     )
                     st.plotly_chart(fig, use_container_width=True, key='p_cd8')
@@ -819,30 +819,30 @@ if uploaded:
             cols2 = st.columns(3)
 
             with cols2[0]:
-                if ch['Daudi']:
+                if ch.get('Daudi'):
                     fig, n, pct, _ = create_flowjo_plot(
-                        data, ch['Daudi'], ch['SSC-A'], 'Daudi', 'SSC-A',
+                        data, ch.get('Daudi'), ch['SSC-A'], 'Daudi', 'SSC-A',
                         'Daudi (cibles)', polygons.get('daudi'), masks['live'], 'Daudi', plot_type
                     )
                     st.plotly_chart(fig, use_container_width=True, key='p_daudi')
 
             with cols2[1]:
-                if ch['mCD45']:
+                if ch.get('mCD45'):
                     fig, n, pct, _ = create_flowjo_plot(
-                        data, ch['mCD45'], ch['SSC-A'], 'mCD45', 'SSC-A',
+                        data, ch.get('mCD45'), ch['SSC-A'], 'mCD45', 'SSC-A',
                         'mCD45+', None, masks['live'], 'mCD45', plot_type
                     )
                     st.plotly_chart(fig, use_container_width=True, key='p_mcd45')
 
             # CD4 vs CD8 avec quadrants
             with cols2[2]:
-                if ch['CD4'] and ch['CD8']:
-                    cd4_thresh = thresholds.get('CD4', auto_find_threshold(data, ch['CD4'], masks['tcells']))
-                    cd8_thresh = thresholds.get('CD8', auto_find_threshold(data, ch['CD8'], masks['tcells']))
+                if ch.get('CD4') and ch.get('CD8'):
+                    cd4_thresh = thresholds.get('CD4', auto_find_threshold(data, ch.get('CD4'), masks['tcells']))
+                    cd8_thresh = thresholds.get('CD8', auto_find_threshold(data, ch.get('CD8'), masks['tcells']))
 
                     quad_lines = (cd4_thresh, cd8_thresh) if show_quadrants else None
                     fig, n, pct, qstats = create_flowjo_plot(
-                        data, ch['CD4'], ch['CD8'], 'CD4', 'CD8',
+                        data, ch.get('CD4'), ch.get('CD8'), 'CD4', 'CD8',
                         'CD4 vs CD8', None, masks['tcells'], '', plot_type, quad_lines
                     )
                     st.plotly_chart(fig, use_container_width=True, key='p_cd4cd8')
@@ -853,8 +853,8 @@ if uploaded:
             marker_results = []
 
             # hPDL1
-            if ch['hPDL1']:
-                stats = calculate_marker_stats(data, ch['hPDL1'], masks.get('leucocytes'), thresholds.get('hPDL1'))
+            if ch.get('hPDL1'):
+                stats = calculate_marker_stats(data, ch.get('hPDL1'), masks.get('leucocytes'), thresholds.get('hPDL1'))
                 if stats:
                     marker_results.append({
                         'Marqueur': 'hPDL1',
@@ -866,8 +866,8 @@ if uploaded:
                     })
 
             # hPD1
-            if ch['hPD1']:
-                stats = calculate_marker_stats(data, ch['hPD1'], masks.get('tcells'), thresholds.get('hPD1'))
+            if ch.get('hPD1'):
+                stats = calculate_marker_stats(data, ch.get('hPD1'), masks.get('tcells'), thresholds.get('hPD1'))
                 if stats:
                     marker_results.append({
                         'Marqueur': 'hPD1',
@@ -879,9 +879,9 @@ if uploaded:
                     })
 
             # hCD16
-            if ch['CD16']:
+            if ch.get('CD16'):
                 parent = masks.get('nk') or masks.get('leucocytes')
-                stats = calculate_marker_stats(data, ch['CD16'], parent, thresholds.get('hCD16'))
+                stats = calculate_marker_stats(data, ch.get('CD16'), parent, thresholds.get('hCD16'))
                 if stats:
                     marker_results.append({
                         'Marqueur': 'hCD16',
@@ -893,9 +893,9 @@ if uploaded:
                     })
 
             # Granzyme B
-            if ch['GranzymeB']:
+            if ch.get('GranzymeB'):
                 parent = masks.get('nk') or masks.get('tcells') or masks.get('leucocytes')
-                stats = calculate_marker_stats(data, ch['GranzymeB'], parent, thresholds.get('GranzymeB'))
+                stats = calculate_marker_stats(data, ch.get('GranzymeB'), parent, thresholds.get('GranzymeB'))
                 if stats:
                     marker_results.append({
                         'Marqueur': 'Granzyme B+',
@@ -916,14 +916,14 @@ if uploaded:
                 cols = st.columns(2)
 
                 # PD1 vs PDL1
-                if ch['hPD1'] and ch['hPDL1']:
+                if ch.get('hPD1') and ch.get('hPDL1'):
                     with cols[0]:
                         pd1_thresh = thresholds.get('hPD1', 0)
                         pdl1_thresh = thresholds.get('hPDL1', 0)
                         quad_lines = (pd1_thresh, pdl1_thresh) if show_quadrants else None
 
                         fig, _, _, qstats = create_flowjo_plot(
-                            data, ch['hPD1'], ch['hPDL1'], 'hPD1', 'hPDL1',
+                            data, ch.get('hPD1'), ch.get('hPDL1'), 'hPD1', 'hPDL1',
                             'PD1 vs PDL1', None, masks.get('tcells'), '', plot_type, quad_lines
                         )
                         st.plotly_chart(fig, use_container_width=True, key='p_pd1pdl1')
@@ -938,14 +938,14 @@ if uploaded:
                             """)
 
                 # CD16 vs Granzyme B
-                if ch['CD16'] and ch['GranzymeB']:
+                if ch.get('CD16') and ch.get('GranzymeB'):
                     with cols[1]:
                         cd16_thresh = thresholds.get('hCD16', 0)
                         grzb_thresh = thresholds.get('GranzymeB', 0)
                         quad_lines = (cd16_thresh, grzb_thresh) if show_quadrants else None
 
                         fig, _, _, qstats = create_flowjo_plot(
-                            data, ch['CD16'], ch['GranzymeB'], 'CD16', 'Granzyme B',
+                            data, ch.get('CD16'), ch.get('GranzymeB'), 'CD16', 'Granzyme B',
                             'CD16 vs Granzyme B', None, masks.get('nk') or masks.get('leucocytes'), '', plot_type, quad_lines
                         )
                         st.plotly_chart(fig, use_container_width=True, key='p_cd16grzb')
