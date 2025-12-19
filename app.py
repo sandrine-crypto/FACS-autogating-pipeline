@@ -1,728 +1,609 @@
 #!/usr/bin/env python3
 """
-FACS Autogating - Gates Interactifs sur Graphiques
-- Rectangles de gating visibles et ajustables directement sur chaque graphe
-- Drag & drop pour déplacer/redimensionner les gates
-- Mise à jour en temps réel des statistiques
+FACS Autogating - Gates Polygonaux Interactifs v3
+- Gates polygonaux (convex hull) au lieu de rectangles
+- Modification directe des sommets sur le graphique
+- Sélection d'un point puis déplacement
+- Auto-gating GMM + apprentissage
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from sklearn.mixture import GaussianMixture
+from scipy.spatial import ConvexHull
 from pathlib import Path
 import tempfile
 import io
+import json
+import os
 from datetime import datetime
 import flowio
-import re
 
-# Configuration
-st.set_page_config(
-    page_title="FACS - Gates Interactifs",
-    page_icon="🔬",
-    layout="wide"
-)
+st.set_page_config(page_title="FACS - Polygones Interactifs", page_icon="🔬", layout="wide")
 
-# CSS
+LEARNED_PARAMS_FILE = "learned_gating_params.json"
+
 st.markdown("""
-    <style>
-    .main-header { font-size: 2rem; color: #2c3e50; text-align: center; }
-    .stats-box { background: #f0f7ff; padding: 1rem; border-radius: 0.5rem; 
-                 border-left: 4px solid #3498db; margin: 0.5rem 0; }
-    .instruction { background: #fff3cd; padding: 0.8rem; border-radius: 0.5rem;
-                   border-left: 4px solid #ffc107; margin: 0.5rem 0; font-size: 0.9rem; }
-    </style>
+<style>
+.main-header { font-size: 1.8rem; color: #2c3e50; text-align: center; margin-bottom: 0.5rem; }
+.info-box { background: #e7f3ff; padding: 0.8rem; border-radius: 0.5rem; border-left: 4px solid #0066cc; margin: 0.5rem 0; }
+.edit-panel { background: #f8f9fa; padding: 1rem; border-radius: 0.5rem; border: 1px solid #dee2e6; }
+.point-btn { margin: 2px; }
+</style>
 """, unsafe_allow_html=True)
+
+
+def load_learned_params():
+    if os.path.exists(LEARNED_PARAMS_FILE):
+        try:
+            with open(LEARNED_PARAMS_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {'n_corrections': 0, 'gates': {}}
+
+
+def save_learned_params(params):
+    with open(LEARNED_PARAMS_FILE, 'w') as f:
+        json.dump(params, f)
+
+
+def update_learned_params(gate_name, original_polygon, corrected_polygon):
+    params = load_learned_params()
+    if gate_name not in params['gates']:
+        params['gates'][gate_name] = {'avg_adjustment': {'x': 0, 'y': 0}, 'n_samples': 0}
+    gate_params = params['gates'][gate_name]
+    orig_center = np.mean(original_polygon, axis=0)
+    corr_center = np.mean(corrected_polygon, axis=0)
+    dx, dy = float(corr_center[0] - orig_center[0]), float(corr_center[1] - orig_center[1])
+    gate_params['n_samples'] += 1
+    n = gate_params['n_samples']
+    alpha = 2 / (n + 1)
+    gate_params['avg_adjustment']['x'] = (1 - alpha) * gate_params['avg_adjustment']['x'] + alpha * dx
+    gate_params['avg_adjustment']['y'] = (1 - alpha) * gate_params['avg_adjustment']['y'] + alpha * dy
+    params['n_corrections'] += 1
+    save_learned_params(params)
 
 
 class FCSReader:
     def __init__(self, fcs_path):
-        self.fcs_path = fcs_path
         self.flow_data = flowio.FlowData(fcs_path)
-        self.data = None
-        self.channels = []
-        self.channel_markers = {}
         self.filename = Path(fcs_path).stem
-        self.load_data()
-    
-    def load_data(self):
-        events = self.flow_data.events
-        n_channels = self.flow_data.channel_count
-        
-        if not isinstance(events, np.ndarray):
-            events = np.array(events, dtype=np.float64)
-        
+        events = np.array(self.flow_data.events, dtype=np.float64)
+        n_ch = self.flow_data.channel_count
         if events.ndim == 1:
-            n_events = len(events) // n_channels
-            events = events.reshape(n_events, n_channels)
-        
-        pnn_labels = []
-        for i in range(1, n_channels + 1):
-            pnn = self.flow_data.text.get(f'$P{i}N', None) or self.flow_data.text.get(f'p{i}n', f'Ch{i}')
-            pns = self.flow_data.text.get(f'$P{i}S', None) or self.flow_data.text.get(f'p{i}s', '')
-            pnn = pnn.strip() if pnn else f'Ch{i}'
-            pns = pns.strip() if pns else ''
-            
-            marker = pnn
-            if pns:
-                match = re.search(r'[hm]?(CD\d+[a-z]?|FoxP3|Granzyme|PD[L]?1|HLA|Viab)', pns, re.IGNORECASE)
-                if match:
-                    marker = match.group(0).lstrip('hm')
-            
-            self.channel_markers[pnn] = marker
-            pnn_labels.append(pnn)
-        
-        self.channels = pnn_labels
-        self.data = pd.DataFrame(events, columns=self.channels)
-        return self.data
-    
-    def get_marker(self, channel):
-        return self.channel_markers.get(channel, channel)
+            events = events.reshape(-1, n_ch)
+        labels = []
+        for i in range(1, n_ch + 1):
+            pnn = self.flow_data.text.get(f'$P{i}N', '') or self.flow_data.text.get(f'p{i}n', f'Ch{i}')
+            labels.append(str(pnn).strip() if pnn else f'Ch{i}')
+        self.channels = labels
+        self.data = pd.DataFrame(events, columns=labels)
 
 
-def find_channel(data, keywords):
-    for col in data.columns:
-        col_upper = col.upper()
+def find_channel(columns, keywords):
+    for col in columns:
         for kw in keywords:
-            if kw.upper() in col_upper:
+            if kw.upper() in col.upper():
                 return col
     return None
 
 
-def biex_transform(x):
-    """Transformation biexponentielle simplifiée"""
-    x = np.asarray(x, dtype=float)
-    return np.arcsinh(x / 150) * 50
+def biex(x):
+    return np.arcsinh(np.asarray(x, float) / 150) * 50
 
 
-def create_interactive_plot(data, x_channel, y_channel, x_marker, y_marker, 
-                            title, gate_coords=None, parent_mask=None,
-                            plot_id="plot", is_quadrant=False):
-    """
-    Crée un graphique Plotly interactif avec gate ajustable
-    gate_coords: dict avec x0, x1, y0, y1 pour rectangle ou x_thresh, y_thresh pour quadrant
-    """
+def point_in_polygon(x, y, polygon):
+    """Ray casting algorithm"""
+    if polygon is None or len(polygon) < 3:
+        return np.zeros(len(x), dtype=bool)
+    n = len(polygon)
+    px = np.array([p[0] for p in polygon])
+    py = np.array([p[1] for p in polygon])
+    inside = np.zeros(len(x), dtype=bool)
+    j = n - 1
+    for i in range(n):
+        cond = ((py[i] > y) != (py[j] > y)) & (x < (px[j] - px[i]) * (y - py[i]) / (py[j] - py[i] + 1e-10) + px[i])
+        inside ^= cond
+        j = i
+    return inside
+
+
+def apply_gate(data, x_ch, y_ch, polygon, parent_mask=None):
+    if x_ch is None or y_ch is None or polygon is None or len(polygon) < 3:
+        return pd.Series(False, index=data.index)
+    base = parent_mask.values if parent_mask is not None else np.ones(len(data), dtype=bool)
+    x, y = data[x_ch].values, data[y_ch].values
+    valid = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0) & base
+    if not valid.any():
+        return pd.Series(False, index=data.index)
+    xt, yt = biex(x), biex(y)
+    in_poly = point_in_polygon(xt, yt, polygon)
+    result = np.zeros(len(data), dtype=bool)
+    result[valid & in_poly] = True
+    return pd.Series(result, index=data.index)
+
+
+def auto_gate_gmm(data, x_ch, y_ch, parent_mask=None, n_comp=2, mode='main'):
+    if x_ch is None or y_ch is None:
+        return None
+    subset = data[parent_mask] if parent_mask is not None and parent_mask.sum() > 0 else data
+    if len(subset) < 100:
+        return None
+    x, y = subset[x_ch].values, subset[y_ch].values
+    valid = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+    if valid.sum() < 100:
+        return None
+    xt, yt = biex(x[valid]), biex(y[valid])
+    X = np.column_stack([xt, yt])
+    try:
+        gmm = GaussianMixture(n_components=n_comp, covariance_type='full', random_state=42, n_init=3)
+        gmm.fit(X)
+        labels = gmm.predict(X)
+        if mode == 'main':
+            target = np.argmax([np.sum(labels == i) for i in range(n_comp)])
+        elif mode == 'low_x':
+            target = np.argmin([np.mean(xt[labels == i]) for i in range(n_comp)])
+        elif mode == 'high_x':
+            target = np.argmax([np.mean(xt[labels == i]) for i in range(n_comp)])
+        elif mode == 'high_x_low_y':
+            target = np.argmax([np.mean(xt[labels == i]) - np.mean(yt[labels == i]) for i in range(n_comp)])
+        else:
+            target = 0
+        mask = labels == target
+        cx, cy = xt[mask], yt[mask]
+        if len(cx) < 30:
+            return None
+        # Convex Hull
+        pts = np.column_stack([cx, cy])
+        hull = ConvexHull(pts)
+        hp = pts[hull.vertices]
+        center = hp.mean(axis=0)
+        # Expand 10%
+        polygon = [(center[0] + 1.1 * (p[0] - center[0]), center[1] + 1.1 * (p[1] - center[1])) for p in hp]
+        # Simplifier à 8-12 points max
+        if len(polygon) > 12:
+            step = max(1, len(polygon) // 10)
+            polygon = polygon[::step]
+        return polygon
+    except:
+        return None
+
+
+def apply_learned_adj(polygon, gate_name):
+    if polygon is None:
+        return None
+    params = load_learned_params()
+    if gate_name in params['gates']:
+        adj = params['gates'][gate_name]['avg_adjustment']
+        if abs(adj['x']) > 0.5 or abs(adj['y']) > 0.5:
+            return [(p[0] + adj['x'], p[1] + adj['y']) for p in polygon]
+    return polygon
+
+
+def create_interactive_plot(data, x_ch, y_ch, x_label, y_label, title, polygon, parent_mask, gate_name):
+    """Crée un graphique Plotly avec polygone et points de contrôle"""
     
-    # Appliquer le masque parent si fourni
-    if parent_mask is not None:
-        plot_data = data[parent_mask].copy()
-    else:
-        plot_data = data.copy()
-    
-    if len(plot_data) == 0:
+    if x_ch is None or y_ch is None:
         fig = go.Figure()
-        fig.add_annotation(text="No data", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+        fig.add_annotation(text=f"Canal non trouvé", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
         return fig, 0, 0
     
-    # Extraire et transformer les données
-    x_data = plot_data[x_channel].values
-    y_data = plot_data[y_channel].values
+    subset = data[parent_mask] if parent_mask is not None and parent_mask.sum() > 0 else data
+    n_parent = len(subset)
     
-    valid = np.isfinite(x_data) & np.isfinite(y_data) & (x_data > 0) & (y_data > 0)
-    x_valid = x_data[valid]
-    y_valid = y_data[valid]
-    
-    if len(x_valid) == 0:
+    if n_parent == 0:
         fig = go.Figure()
+        fig.add_annotation(text="Pas de données", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
         return fig, 0, 0
     
-    # Transformer pour affichage
-    x_plot = biex_transform(x_valid)
-    y_plot = biex_transform(y_valid)
+    x, y = subset[x_ch].values, subset[y_ch].values
+    valid = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+    xt, yt = biex(x[valid]), biex(y[valid])
     
-    # Sous-échantillonner si trop de points
-    max_points = 20000
-    if len(x_plot) > max_points:
-        idx = np.random.choice(len(x_plot), max_points, replace=False)
-        x_plot_display = x_plot[idx]
-        y_plot_display = y_plot[idx]
+    # Sous-échantillonner
+    if len(xt) > 8000:
+        idx = np.random.choice(len(xt), 8000, replace=False)
+        xd, yd = xt[idx], yt[idx]
     else:
-        x_plot_display = x_plot
-        y_plot_display = y_plot
+        xd, yd = xt, yt
     
-    # Créer la figure
     fig = go.Figure()
     
-    # Ajouter les points (scatter plot style FlowJo)
+    # Scatter plot
     fig.add_trace(go.Scattergl(
-        x=x_plot_display, y=y_plot_display,
+        x=xd, y=yd,
         mode='markers',
-        marker=dict(
-            size=3,
-            color=y_plot_display,  # Colorer par densité Y
-            colorscale='Jet',
-            opacity=0.6,
-            showscale=False
-        ),
-        name='Events',
-        hoverinfo='skip'
+        marker=dict(size=2, color=yd, colorscale='Viridis', opacity=0.5),
+        hoverinfo='skip',
+        name='Data'
     ))
     
-    n_in_gate = 0
-    pct = 0
-    n_total = len(x_valid)
+    n_in, pct = 0, 0
     
-    if is_quadrant and gate_coords:
-        # Mode quadrant avec lignes croisées
-        x_thresh = gate_coords.get('x_thresh', np.median(x_valid))
-        y_thresh = gate_coords.get('y_thresh', np.median(y_valid))
+    if polygon and len(polygon) >= 3:
+        # Calculer stats
+        full_mask = apply_gate(data, x_ch, y_ch, polygon, parent_mask)
+        n_in = full_mask.sum()
+        pct = n_in / n_parent * 100 if n_parent > 0 else 0
         
-        x_thresh_t = biex_transform([x_thresh])[0]
-        y_thresh_t = biex_transform([y_thresh])[0]
+        # Polygone - remplissage
+        px = [p[0] for p in polygon] + [polygon[0][0]]
+        py = [p[1] for p in polygon] + [polygon[0][1]]
         
-        # Lignes de quadrant (shapes editables)
-        fig.add_shape(
-            type="line",
-            x0=x_thresh_t, x1=x_thresh_t,
-            y0=min(y_plot), y1=max(y_plot),
-            line=dict(color="red", width=3),
-            editable=True,
-            name="X threshold"
-        )
-        fig.add_shape(
-            type="line",
-            x0=min(x_plot), x1=max(x_plot),
-            y0=y_thresh_t, y1=y_thresh_t,
-            line=dict(color="red", width=3),
-            editable=True,
-            name="Y threshold"
-        )
+        fig.add_trace(go.Scatter(
+            x=px, y=py,
+            fill='toself',
+            fillcolor='rgba(255, 0, 0, 0.1)',
+            line=dict(color='red', width=2),
+            mode='lines',
+            name='Gate',
+            hoverinfo='skip'
+        ))
         
-        # Calculer % dans chaque quadrant
-        q1 = ((x_valid >= x_thresh) & (y_valid >= y_thresh)).sum()  # ++
-        q2 = ((x_valid < x_thresh) & (y_valid >= y_thresh)).sum()   # -+
-        q3 = ((x_valid < x_thresh) & (y_valid < y_thresh)).sum()    # --
-        q4 = ((x_valid >= x_thresh) & (y_valid < y_thresh)).sum()   # +-
+        # Points de contrôle (sommets)
+        fig.add_trace(go.Scatter(
+            x=[p[0] for p in polygon],
+            y=[p[1] for p in polygon],
+            mode='markers+text',
+            marker=dict(size=14, color='red', symbol='circle',
+                       line=dict(color='darkred', width=2)),
+            text=[str(i+1) for i in range(len(polygon))],
+            textposition='top center',
+            textfont=dict(size=11, color='darkred', family='Arial Black'),
+            name='Sommets',
+            hovertemplate='<b>Point %{text}</b><br>X: %{x:.1f}<br>Y: %{y:.1f}<extra></extra>'
+        ))
         
-        # Annotations pour chaque quadrant
-        x_range = max(x_plot) - min(x_plot)
-        y_range = max(y_plot) - min(y_plot)
-        
-        annotations_pos = [
-            (max(x_plot) - x_range*0.15, max(y_plot) - y_range*0.05, f"{q1/n_total*100:.1f}%"),  # Q1
-            (min(x_plot) + x_range*0.05, max(y_plot) - y_range*0.05, f"{q2/n_total*100:.1f}%"),  # Q2
-            (min(x_plot) + x_range*0.05, min(y_plot) + y_range*0.05, f"{q3/n_total*100:.1f}%"),  # Q3
-            (max(x_plot) - x_range*0.15, min(y_plot) + y_range*0.05, f"{q4/n_total*100:.1f}%"),  # Q4
-        ]
-        
-        for x_pos, y_pos, text in annotations_pos:
-            fig.add_annotation(
-                x=x_pos, y=y_pos, text=text,
-                showarrow=False, font=dict(size=14, color="red", family="Arial Black"),
-                bgcolor="white", bordercolor="red", borderwidth=1
-            )
-        
-        n_in_gate = q1 + q4  # Exemple: positifs en X
-        pct = n_in_gate / n_total * 100 if n_total > 0 else 0
-        
-    elif gate_coords:
-        # Mode rectangle
-        x0 = gate_coords.get('x0', np.percentile(x_valid, 5))
-        x1 = gate_coords.get('x1', np.percentile(x_valid, 95))
-        y0 = gate_coords.get('y0', np.percentile(y_valid, 5))
-        y1 = gate_coords.get('y1', np.percentile(y_valid, 95))
-        
-        # Transformer les coordonnées
-        x0_t = biex_transform([x0])[0]
-        x1_t = biex_transform([x1])[0]
-        y0_t = biex_transform([y0])[0]
-        y1_t = biex_transform([y1])[0]
-        
-        # Rectangle editable
-        fig.add_shape(
-            type="rect",
-            x0=x0_t, x1=x1_t, y0=y0_t, y1=y1_t,
-            line=dict(color="red", width=3),
-            fillcolor="rgba(255,0,0,0.1)",
-            editable=True,
-            name="Gate"
-        )
-        
-        # Calculer % dans le gate
-        in_gate = (x_valid >= x0) & (x_valid <= x1) & (y_valid >= y0) & (y_valid <= y1)
-        n_in_gate = in_gate.sum()
-        pct = n_in_gate / n_total * 100 if n_total > 0 else 0
-        
-        # Annotation avec stats
+        # Annotation centrale
+        cx = np.mean([p[0] for p in polygon])
+        cy = np.mean([p[1] for p in polygon])
         fig.add_annotation(
-            x=x1_t, y=y1_t,
-            text=f"<b>{gate_coords.get('name', 'Gate')}</b><br>{pct:.1f}%<br>({n_in_gate:,})",
-            showarrow=True, arrowhead=2,
-            font=dict(size=12, color="red"),
-            bgcolor="white", bordercolor="red", borderwidth=2,
-            ax=30, ay=-30
+            x=cx, y=cy,
+            text=f"<b>{gate_name}</b><br>{pct:.1f}%<br>({n_in:,})",
+            showarrow=False,
+            font=dict(size=11, color='darkred'),
+            bgcolor='rgba(255,255,255,0.9)',
+            bordercolor='red',
+            borderwidth=1
         )
     
-    # Configuration du layout
     fig.update_layout(
-        title=dict(text=f"<b>{title}</b><br><sup>n={n_total:,}</sup>", x=0.5),
-        xaxis_title=f"<b>{x_marker}</b>",
-        yaxis_title=f"<b>{y_marker}</b>",
+        title=dict(text=f"<b>{title}</b><br><sup>Parent: {n_parent:,}</sup>", x=0.5, font=dict(size=12)),
+        xaxis_title=x_label,
+        yaxis_title=y_label,
         showlegend=False,
-        width=450,
-        height=400,
-        dragmode='pan',
-        margin=dict(l=60, r=20, t=60, b=60),
+        height=420,
+        margin=dict(l=50, r=20, t=60, b=50),
         plot_bgcolor='white',
         paper_bgcolor='white',
-        xaxis=dict(
-            showgrid=True,
-            gridcolor='lightgray',
-            gridwidth=1,
-            zeroline=False,
-            showline=True,
-            linecolor='black',
-            linewidth=1
-        ),
-        yaxis=dict(
-            showgrid=True,
-            gridcolor='lightgray',
-            gridwidth=1,
-            zeroline=False,
-            showline=True,
-            linecolor='black',
-            linewidth=1
-        )
+        xaxis=dict(showgrid=True, gridcolor='#f0f0f0', zeroline=False, showline=True, linecolor='#ccc'),
+        yaxis=dict(showgrid=True, gridcolor='#f0f0f0', zeroline=False, showline=True, linecolor='#ccc'),
     )
     
-    # Permettre l'édition des shapes
-    fig.update_layout(
-        newshape=dict(line_color='red', fillcolor='rgba(255,0,0,0.1)'),
-        modebar=dict(
-            add=['drawrect', 'drawline', 'eraseshape'],
-            remove=['lasso2d', 'select2d']
-        )
-    )
-    
-    return fig, n_in_gate, pct
+    return fig, n_in, pct
 
 
-def apply_gate(data, x_channel, y_channel, gate_coords, parent_mask=None):
-    """Applique un gate et retourne le masque"""
-    if parent_mask is not None:
-        working_mask = parent_mask.copy()
-    else:
-        working_mask = pd.Series(True, index=data.index)
-    
-    x_data = data[x_channel]
-    y_data = data[y_channel]
-    
-    if 'x0' in gate_coords:
-        # Rectangle gate
-        gate_mask = (x_data >= gate_coords['x0']) & (x_data <= gate_coords['x1']) & \
-                    (y_data >= gate_coords['y0']) & (y_data <= gate_coords['y1'])
-    else:
-        # Quadrant gate (retourne le quadrant positif-positif par défaut)
-        gate_mask = (x_data >= gate_coords.get('x_thresh', 0)) & \
-                    (y_data >= gate_coords.get('y_thresh', 0))
-    
-    return working_mask & gate_mask
+def move_polygon(polygon, dx, dy):
+    if polygon is None:
+        return None
+    return [(p[0] + dx, p[1] + dy) for p in polygon]
 
 
-# ==================== INTERFACE STREAMLIT ====================
+def scale_polygon(polygon, factor):
+    if polygon is None:
+        return None
+    center = np.mean(polygon, axis=0)
+    return [(center[0] + factor * (p[0] - center[0]), center[1] + factor * (p[1] - center[1])) for p in polygon]
 
-st.markdown('<h1 class="main-header">🔬 FACS - Gates Interactifs sur Graphiques</h1>', unsafe_allow_html=True)
 
-st.markdown("""
-<div class="instruction">
-📌 <b>Instructions:</b> Les rectangles rouges sont les gates. 
-<b>Cliquez et glissez</b> les bords ou coins pour ajuster chaque gate directement sur le graphique.
-Les lignes rouges dans les quadrants peuvent aussi être déplacées.
-</div>
-""", unsafe_allow_html=True)
+def move_point(polygon, point_idx, new_x, new_y):
+    """Déplace un point spécifique du polygone"""
+    if polygon is None or point_idx >= len(polygon):
+        return polygon
+    new_poly = list(polygon)
+    new_poly[point_idx] = (new_x, new_y)
+    return new_poly
+
+
+# ===== MAIN =====
+st.markdown('<h1 class="main-header">🔬 FACS - Gates Polygonaux Interactifs</h1>', unsafe_allow_html=True)
+
+learned = load_learned_params()
+n_learned = learned.get('n_corrections', 0)
+if n_learned > 0:
+    st.info(f"🧠 {n_learned} correction(s) apprises")
 
 # Session state
-if 'gates' not in st.session_state:
-    st.session_state.gates = {}
-if 'masks' not in st.session_state:
-    st.session_state.masks = {}
+for key in ['reader', 'data', 'channels', 'polygons', 'original_polygons', 'auto_done']:
+    if key not in st.session_state:
+        st.session_state[key] = {} if 'polygon' in key or key == 'channels' else None
 
-# Upload
-uploaded_file = st.file_uploader("📁 Fichier FCS", type=['fcs'])
+if st.session_state.get('auto_done') is None:
+    st.session_state.auto_done = False
 
-if uploaded_file:
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.fcs') as tmp:
-        tmp.write(uploaded_file.read())
-        tmp_path = tmp.name
-    
-    try:
+# Pour l'édition des points
+if 'edit_gate' not in st.session_state:
+    st.session_state.edit_gate = None
+if 'edit_point' not in st.session_state:
+    st.session_state.edit_point = None
+
+uploaded = st.file_uploader("📁 Fichier FCS", type=['fcs'])
+
+if uploaded:
+    if st.session_state.reader is None or st.session_state.get('fname') != uploaded.name:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.fcs') as tmp:
+            tmp.write(uploaded.read())
+            tmp_path = tmp.name
         with st.spinner("Chargement..."):
             reader = FCSReader(tmp_path)
-            data = reader.data
-        
-        # Métriques
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Événements", f"{len(data):,}")
-        col2.metric("Canaux", len(reader.channels))
-        col3.metric("Fichier", reader.filename[:25])
-        
-        # Trouver les canaux
-        fsc_a = find_channel(data, ['FSC-A'])
-        fsc_h = find_channel(data, ['FSC-H'])
-        ssc_a = find_channel(data, ['SSC-A'])
-        livedead = find_channel(data, ['LiveDead', 'Viab'])
-        hcd45 = find_channel(data, ['PerCP-A'])
-        mcd45 = find_channel(data, ['APC-Fire750'])
-        cd3 = find_channel(data, ['AF488', 'CD3'])
-        cd19 = find_channel(data, ['PE-Fire700', 'CD19'])
-        cd4 = find_channel(data, ['BV650', 'CD4'])
-        cd8 = find_channel(data, ['BUV805', 'CD8'])
-        cd56 = find_channel(data, ['PE-Cy7', 'CD56'])
-        cd16 = find_channel(data, ['NovaFluor', 'CD16'])
-        foxp3 = find_channel(data, ['eFluor450', 'FoxP3'])
-        cd25 = find_channel(data, ['BV785', 'CD25'])
-        
-        # Initialiser les gates avec valeurs par défaut
-        if 'initialized' not in st.session_state:
-            st.session_state.gates = {
-                'cells': {
-                    'x0': float(np.percentile(data[fsc_a], 3)) if fsc_a else 0,
-                    'x1': float(np.percentile(data[fsc_a], 99)) if fsc_a else 1,
-                    'y0': float(np.percentile(data[ssc_a], 3)) if ssc_a else 0,
-                    'y1': float(np.percentile(data[ssc_a], 99)) if ssc_a else 1,
-                    'name': 'Cells'
-                },
-                'singlets': {
-                    'x0': float(np.percentile(data[fsc_a], 2)) if fsc_a else 0,
-                    'x1': float(np.percentile(data[fsc_a], 98)) if fsc_a else 1,
-                    'y0': float(np.percentile(data[fsc_h], 2)) if fsc_h else 0,
-                    'y1': float(np.percentile(data[fsc_h], 98)) if fsc_h else 1,
-                    'name': 'Single Cells'
-                },
-                'live': {
-                    'x0': float(np.percentile(data[livedead], 0)) if livedead else 0,
-                    'x1': float(np.percentile(data[livedead], 85)) if livedead else 1,
-                    'y0': float(np.percentile(data[ssc_a], 2)) if ssc_a else 0,
-                    'y1': float(np.percentile(data[ssc_a], 98)) if ssc_a else 1,
-                    'name': 'Live'
-                },
-                'hcd45': {
-                    'x0': float(np.percentile(data[hcd45], 15)) if hcd45 else 0,
-                    'x1': float(np.percentile(data[hcd45], 100)) if hcd45 else 1,
-                    'y0': float(np.percentile(data[ssc_a], 2)) if ssc_a else 0,
-                    'y1': float(np.percentile(data[ssc_a], 98)) if ssc_a else 1,
-                    'name': 'hCD45+'
-                },
-                'nk': {
-                    'x_thresh': float(np.percentile(data[cd56], 65)) if cd56 else 0,
-                    'y_thresh': float(np.percentile(data[cd16], 65)) if cd16 else 0,
-                },
-                'tb': {
-                    'x_thresh': float(np.percentile(data[cd3], 40)) if cd3 else 0,
-                    'y_thresh': float(np.percentile(data[cd19], 75)) if cd19 else 0,
-                },
-                'cd4cd8': {
-                    'x_thresh': float(np.percentile(data[cd4], 35)) if cd4 else 0,
-                    'y_thresh': float(np.percentile(data[cd8], 75)) if cd8 else 0,
-                },
-                'treg': {
-                    'x_thresh': float(np.percentile(data[foxp3], 90)) if foxp3 else 0,
-                    'y_thresh': float(np.percentile(data[cd25], 85)) if cd25 else 0,
-                },
+            st.session_state.reader = reader
+            st.session_state.data = reader.data
+            st.session_state.fname = uploaded.name
+            st.session_state.polygons = {}
+            st.session_state.original_polygons = {}
+            st.session_state.auto_done = False
+            cols = reader.data.columns
+            st.session_state.channels = {
+                'FSC-A': find_channel(cols, ['FSC-A', 'FSC']),
+                'FSC-H': find_channel(cols, ['FSC-H']),
+                'SSC-A': find_channel(cols, ['SSC-A', 'SSC']),
+                'LiveDead': find_channel(cols, ['LiveDead', 'Viab', 'Aqua', 'Live']),
+                'hCD45': find_channel(cols, ['PerCP', 'CD45']),
+                'CD3': find_channel(cols, ['AF488', 'FITC', 'CD3']),
+                'CD19': find_channel(cols, ['PE-Fire', 'CD19']),
+                'CD4': find_channel(cols, ['BV650', 'CD4']),
+                'CD8': find_channel(cols, ['BUV805', 'APC-Cy7', 'CD8']),
             }
-            st.session_state.initialized = True
-        
-        st.markdown("---")
-        
-        # ==================== GATING HIÉRARCHIQUE ====================
-        
-        st.markdown("## 🔬 Gating Hiérarchique")
-        st.markdown("*Ajustez les rectangles rouges directement sur chaque graphique*")
-        
-        all_stats = []
-        n_total = len(data)
-        
-        # ===== ROW 1: GATING PRINCIPAL =====
-        st.markdown("### 1️⃣ Gating Principal")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        # Plot 1: Cells
-        with col1:
-            st.markdown("##### Cells (FSC-A vs SSC-A)")
-            if fsc_a and ssc_a:
-                fig1, n_cells, pct_cells = create_interactive_plot(
-                    data, fsc_a, ssc_a, 'FSC-A', 'SSC-A',
-                    f"Ungated (n={n_total:,})",
-                    gate_coords=st.session_state.gates['cells']
-                )
-                st.plotly_chart(fig1, use_container_width=True, key="plot_cells")
-                
-                cells_mask = apply_gate(data, fsc_a, ssc_a, st.session_state.gates['cells'])
-                st.session_state.masks['cells'] = cells_mask
-                
-                st.markdown(f"**Cells:** {cells_mask.sum():,} ({cells_mask.sum()/n_total*100:.1f}%)")
-                all_stats.append({'Population': 'Cells', 'Parent': 'Ungated', 
-                                 'Count': cells_mask.sum(), '% Parent': round(cells_mask.sum()/n_total*100, 1)})
-        
-        # Plot 2: Singlets
-        with col2:
-            st.markdown("##### Single Cells (FSC-A vs FSC-H)")
-            if fsc_a and fsc_h and 'cells' in st.session_state.masks:
-                fig2, n_sing, pct_sing = create_interactive_plot(
-                    data, fsc_a, fsc_h, 'FSC-A', 'FSC-H',
-                    f"Cells (n={cells_mask.sum():,})",
-                    gate_coords=st.session_state.gates['singlets'],
-                    parent_mask=st.session_state.masks['cells']
-                )
-                st.plotly_chart(fig2, use_container_width=True, key="plot_singlets")
-                
-                singlets_mask = apply_gate(data, fsc_a, fsc_h, st.session_state.gates['singlets'], 
-                                          st.session_state.masks['cells'])
-                st.session_state.masks['singlets'] = singlets_mask
-                
-                n_parent = cells_mask.sum()
-                st.markdown(f"**Singlets:** {singlets_mask.sum():,} ({singlets_mask.sum()/n_parent*100:.1f}%)")
-                all_stats.append({'Population': 'Single Cells', 'Parent': 'Cells',
-                                 'Count': singlets_mask.sum(), '% Parent': round(singlets_mask.sum()/n_parent*100, 1)})
-        
-        # Plot 3: Live
-        with col3:
-            st.markdown("##### Live (Live/Dead vs SSC-A)")
-            if livedead and ssc_a and 'singlets' in st.session_state.masks:
-                fig3, n_live, pct_live = create_interactive_plot(
-                    data, livedead, ssc_a, 'Live/Dead', 'SSC-A',
-                    f"Singlets (n={singlets_mask.sum():,})",
-                    gate_coords=st.session_state.gates['live'],
-                    parent_mask=st.session_state.masks['singlets']
-                )
-                st.plotly_chart(fig3, use_container_width=True, key="plot_live")
-                
-                live_mask = apply_gate(data, livedead, ssc_a, st.session_state.gates['live'],
-                                      st.session_state.masks['singlets'])
-                st.session_state.masks['live'] = live_mask
-                
-                n_parent = singlets_mask.sum()
-                st.markdown(f"**Live:** {live_mask.sum():,} ({live_mask.sum()/n_parent*100:.1f}%)")
-                all_stats.append({'Population': 'Live', 'Parent': 'Single Cells',
-                                 'Count': live_mask.sum(), '% Parent': round(live_mask.sum()/n_parent*100, 1)})
-        
-        # Plot 4: hCD45+
-        with col4:
-            st.markdown("##### hCD45+ (hCD45 vs SSC-A)")
-            if hcd45 and ssc_a and 'live' in st.session_state.masks:
-                fig4, n_hcd45, pct_hcd45 = create_interactive_plot(
-                    data, hcd45, ssc_a, 'hCD45', 'SSC-A',
-                    f"Live (n={live_mask.sum():,})",
-                    gate_coords=st.session_state.gates['hcd45'],
-                    parent_mask=st.session_state.masks['live']
-                )
-                st.plotly_chart(fig4, use_container_width=True, key="plot_hcd45")
-                
-                hcd45_mask = apply_gate(data, hcd45, ssc_a, st.session_state.gates['hcd45'],
-                                       st.session_state.masks['live'])
-                st.session_state.masks['hcd45'] = hcd45_mask
-                
-                n_parent = live_mask.sum()
-                st.markdown(f"**hCD45+:** {hcd45_mask.sum():,} ({hcd45_mask.sum()/n_parent*100:.1f}%)")
-                all_stats.append({'Population': 'hCD45+ (Leucocytes)', 'Parent': 'Live',
-                                 'Count': hcd45_mask.sum(), '% Parent': round(hcd45_mask.sum()/n_parent*100, 1)})
-        
-        # ===== ROW 2: SOUS-POPULATIONS =====
-        st.markdown("### 2️⃣ Sous-Populations (Quadrants)")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        # Plot 5: NK cells
-        with col1:
-            st.markdown("##### NK cells (CD56 vs CD16)")
-            if cd56 and cd16 and 'hcd45' in st.session_state.masks:
-                fig5, _, _ = create_interactive_plot(
-                    data, cd56, cd16, 'CD56', 'CD16',
-                    f"hCD45+ (n={hcd45_mask.sum():,})",
-                    gate_coords=st.session_state.gates['nk'],
-                    parent_mask=st.session_state.masks['hcd45'],
-                    is_quadrant=True
-                )
-                st.plotly_chart(fig5, use_container_width=True, key="plot_nk")
-        
-        # Plot 6: T/B cells
-        with col2:
-            st.markdown("##### T/B cells (CD3 vs CD19)")
-            if cd3 and cd19 and 'hcd45' in st.session_state.masks:
-                fig6, _, _ = create_interactive_plot(
-                    data, cd3, cd19, 'CD3', 'CD19',
-                    f"hCD45+ (n={hcd45_mask.sum():,})",
-                    gate_coords=st.session_state.gates['tb'],
-                    parent_mask=st.session_state.masks['hcd45'],
-                    is_quadrant=True
-                )
-                st.plotly_chart(fig6, use_container_width=True, key="plot_tb")
-                
-                # Créer mask T cells
-                t_thresh_x = st.session_state.gates['tb']['x_thresh']
-                t_thresh_y = st.session_state.gates['tb']['y_thresh']
-                t_mask = st.session_state.masks['hcd45'] & (data[cd3] >= t_thresh_x) & (data[cd19] < t_thresh_y)
-                st.session_state.masks['t_cells'] = t_mask
-                
-                b_mask = st.session_state.masks['hcd45'] & (data[cd3] < t_thresh_x) & (data[cd19] >= t_thresh_y)
-                
-                n_parent = hcd45_mask.sum()
-                all_stats.append({'Population': 'T cells', 'Parent': 'hCD45+',
-                                 'Count': t_mask.sum(), '% Parent': round(t_mask.sum()/n_parent*100, 1)})
-                all_stats.append({'Population': 'B cells', 'Parent': 'hCD45+',
-                                 'Count': b_mask.sum(), '% Parent': round(b_mask.sum()/n_parent*100, 1)})
-        
-        # Plot 7: CD4/CD8
-        with col3:
-            st.markdown("##### CD4/CD8 (CD4 vs CD8)")
-            if cd4 and cd8 and 't_cells' in st.session_state.masks:
-                t_cells_mask = st.session_state.masks['t_cells']
-                fig7, _, _ = create_interactive_plot(
-                    data, cd4, cd8, 'CD4', 'CD8',
-                    f"T cells (n={t_cells_mask.sum():,})",
-                    gate_coords=st.session_state.gates['cd4cd8'],
-                    parent_mask=t_cells_mask,
-                    is_quadrant=True
-                )
-                st.plotly_chart(fig7, use_container_width=True, key="plot_cd4cd8")
-                
-                # Créer mask CD4+
-                cd4_thresh_x = st.session_state.gates['cd4cd8']['x_thresh']
-                cd4_thresh_y = st.session_state.gates['cd4cd8']['y_thresh']
-                cd4_mask = t_cells_mask & (data[cd4] >= cd4_thresh_x) & (data[cd8] < cd4_thresh_y)
-                st.session_state.masks['cd4_cells'] = cd4_mask
-                
-                cd8_mask = t_cells_mask & (data[cd4] < cd4_thresh_x) & (data[cd8] >= cd4_thresh_y)
-                
-                n_parent = t_cells_mask.sum()
-                if n_parent > 0:
-                    all_stats.append({'Population': 'CD4+ T cells', 'Parent': 'T cells',
-                                     'Count': cd4_mask.sum(), '% Parent': round(cd4_mask.sum()/n_parent*100, 1)})
-                    all_stats.append({'Population': 'CD8+ T cells', 'Parent': 'T cells',
-                                     'Count': cd8_mask.sum(), '% Parent': round(cd8_mask.sum()/n_parent*100, 1)})
-        
-        # Plot 8: Treg
-        with col4:
-            st.markdown("##### Treg (FoxP3 vs CD25)")
-            if foxp3 and cd25 and 'cd4_cells' in st.session_state.masks:
-                cd4_cells_mask = st.session_state.masks['cd4_cells']
-                fig8, _, _ = create_interactive_plot(
-                    data, foxp3, cd25, 'FoxP3', 'CD25',
-                    f"CD4+ (n={cd4_cells_mask.sum():,})",
-                    gate_coords=st.session_state.gates['treg'],
-                    parent_mask=cd4_cells_mask,
-                    is_quadrant=True
-                )
-                st.plotly_chart(fig8, use_container_width=True, key="plot_treg")
-                
-                # Treg stats
-                treg_thresh_x = st.session_state.gates['treg']['x_thresh']
-                treg_thresh_y = st.session_state.gates['treg']['y_thresh']
-                treg_mask = cd4_cells_mask & (data[foxp3] >= treg_thresh_x) & (data[cd25] >= treg_thresh_y)
-                
-                n_parent = cd4_cells_mask.sum()
-                if n_parent > 0:
-                    all_stats.append({'Population': 'Treg (FoxP3+CD25+)', 'Parent': 'CD4+ T cells',
-                                     'Count': treg_mask.sum(), '% Parent': round(treg_mask.sum()/n_parent*100, 1)})
-        
-        # ==================== STATISTIQUES ====================
-        
-        st.markdown("---")
-        st.markdown("### 📊 Résumé des Populations")
-        
-        if all_stats:
-            stats_df = pd.DataFrame(all_stats)
-            stats_df['% Total'] = (stats_df['Count'] / n_total * 100).round(2)
-            
-            st.dataframe(stats_df, use_container_width=True)
-            
-            # Export
-            col1, col2 = st.columns(2)
-            with col1:
-                csv = stats_df.to_csv(index=False)
-                st.download_button(
-                    "📥 Télécharger CSV",
-                    csv,
-                    f"{reader.filename}_populations.csv",
-                    "text/csv",
-                    use_container_width=True
-                )
-            
-            with col2:
-                # Export Excel
-                try:
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        stats_df.to_excel(writer, sheet_name='Populations', index=False)
-                    output.seek(0)
-                    st.download_button(
-                        "📥 Télécharger Excel",
-                        output,
-                        f"{reader.filename}_populations.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
-                except:
-                    pass
-        
-        # ==================== AJUSTEMENT MANUEL ====================
-        
-        with st.expander("⚙️ Ajustement manuel des seuils (optionnel)"):
-            st.markdown("*Utilisez ces sliders si vous préférez un ajustement précis*")
-            
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.markdown("**Gate Cells**")
-                if fsc_a:
-                    new_x0 = st.number_input("FSC-A min", value=float(st.session_state.gates['cells']['x0']), key="cells_x0")
-                    new_x1 = st.number_input("FSC-A max", value=float(st.session_state.gates['cells']['x1']), key="cells_x1")
-                    st.session_state.gates['cells']['x0'] = new_x0
-                    st.session_state.gates['cells']['x1'] = new_x1
-            
-            with col2:
-                st.markdown("**Quadrant T/B**")
-                if cd3:
-                    new_cd3 = st.number_input("Seuil CD3", value=float(st.session_state.gates['tb']['x_thresh']), key="tb_x")
-                    new_cd19 = st.number_input("Seuil CD19", value=float(st.session_state.gates['tb']['y_thresh']), key="tb_y")
-                    st.session_state.gates['tb']['x_thresh'] = new_cd3
-                    st.session_state.gates['tb']['y_thresh'] = new_cd19
-            
-            with col3:
-                st.markdown("**Quadrant CD4/CD8**")
-                if cd4:
-                    new_cd4 = st.number_input("Seuil CD4", value=float(st.session_state.gates['cd4cd8']['x_thresh']), key="cd4_x")
-                    new_cd8 = st.number_input("Seuil CD8", value=float(st.session_state.gates['cd4cd8']['y_thresh']), key="cd8_y")
-                    st.session_state.gates['cd4cd8']['x_thresh'] = new_cd4
-                    st.session_state.gates['cd4cd8']['y_thresh'] = new_cd8
-            
-            with col4:
-                st.markdown("**Quadrant Treg**")
-                if foxp3:
-                    new_foxp3 = st.number_input("Seuil FoxP3", value=float(st.session_state.gates['treg']['x_thresh']), key="treg_x")
-                    new_cd25 = st.number_input("Seuil CD25", value=float(st.session_state.gates['treg']['y_thresh']), key="treg_y")
-                    st.session_state.gates['treg']['x_thresh'] = new_foxp3
-                    st.session_state.gates['treg']['y_thresh'] = new_cd25
-            
-            if st.button("🔄 Recalculer avec nouveaux seuils", type="primary"):
-                st.rerun()
+
+    reader = st.session_state.reader
+    data = st.session_state.data
+    ch = st.session_state.channels
+    n_total = len(data)
     
-    except Exception as e:
-        st.error(f"Erreur: {e}")
-        st.exception(e)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Événements", f"{n_total:,}")
+    c2.metric("Canaux", len(reader.channels))
+    c3.metric("Fichier", reader.filename[:25])
+    
+    with st.expander("📋 Canaux détectés"):
+        for name, canal in ch.items():
+            st.write(f"{'✅' if canal else '❌'} **{name}**: {canal or 'Non trouvé'}")
+    
+    if ch['FSC-A'] is None or ch['SSC-A'] is None:
+        st.error("❌ FSC-A ou SSC-A non trouvé!")
+        st.stop()
+    
+    st.markdown("---")
+    
+    # AUTO-GATING
+    if not st.session_state.auto_done:
+        if st.button("🚀 LANCER L'AUTO-GATING", type="primary", use_container_width=True):
+            prog = st.progress(0)
+            
+            # Cells
+            poly = auto_gate_gmm(data, ch['FSC-A'], ch['SSC-A'], None, 2, 'main')
+            poly = apply_learned_adj(poly, 'cells')
+            st.session_state.polygons['cells'] = poly
+            st.session_state.original_polygons['cells'] = list(poly) if poly else None
+            prog.progress(25)
+            
+            # Singlets
+            if ch['FSC-H']:
+                cells_m = apply_gate(data, ch['FSC-A'], ch['SSC-A'], poly, None)
+                poly = auto_gate_gmm(data, ch['FSC-A'], ch['FSC-H'], cells_m, 2, 'main')
+                poly = apply_learned_adj(poly, 'singlets')
+            else:
+                poly = None
+            st.session_state.polygons['singlets'] = poly
+            st.session_state.original_polygons['singlets'] = list(poly) if poly else None
+            prog.progress(50)
+            
+            # Live
+            if ch['LiveDead']:
+                cells_m = apply_gate(data, ch['FSC-A'], ch['SSC-A'], st.session_state.polygons['cells'], None)
+                sing_m = apply_gate(data, ch['FSC-A'], ch['FSC-H'], st.session_state.polygons['singlets'], cells_m) if st.session_state.polygons['singlets'] else cells_m
+                poly = auto_gate_gmm(data, ch['LiveDead'], ch['SSC-A'], sing_m, 2, 'low_x')
+                poly = apply_learned_adj(poly, 'live')
+            else:
+                poly = None
+            st.session_state.polygons['live'] = poly
+            st.session_state.original_polygons['live'] = list(poly) if poly else None
+            prog.progress(75)
+            
+            # hCD45
+            if ch['hCD45']:
+                cells_m = apply_gate(data, ch['FSC-A'], ch['SSC-A'], st.session_state.polygons['cells'], None)
+                sing_m = apply_gate(data, ch['FSC-A'], ch['FSC-H'], st.session_state.polygons['singlets'], cells_m) if st.session_state.polygons['singlets'] else cells_m
+                live_m = apply_gate(data, ch['LiveDead'], ch['SSC-A'], st.session_state.polygons['live'], sing_m) if st.session_state.polygons['live'] else sing_m
+                poly = auto_gate_gmm(data, ch['hCD45'], ch['SSC-A'], live_m, 2, 'high_x')
+                poly = apply_learned_adj(poly, 'hcd45')
+            else:
+                poly = None
+            st.session_state.polygons['hcd45'] = poly
+            st.session_state.original_polygons['hcd45'] = list(poly) if poly else None
+            prog.progress(100)
+            
+            st.session_state.auto_done = True
+            st.rerun()
+    
+    # AFFICHAGE
+    if st.session_state.auto_done:
+        polygons = st.session_state.polygons
+        
+        # Recalcul masques
+        cells_m = apply_gate(data, ch['FSC-A'], ch['SSC-A'], polygons.get('cells'), None)
+        sing_m = apply_gate(data, ch['FSC-A'], ch['FSC-H'], polygons.get('singlets'), cells_m) if polygons.get('singlets') else cells_m
+        live_m = apply_gate(data, ch['LiveDead'], ch['SSC-A'], polygons.get('live'), sing_m) if polygons.get('live') else sing_m
+        hcd45_m = apply_gate(data, ch['hCD45'], ch['SSC-A'], polygons.get('hcd45'), live_m) if polygons.get('hcd45') else live_m
+        
+        # Configuration des gates
+        gates_config = [
+            ('cells', 'Cells', ch['FSC-A'], ch['SSC-A'], 'FSC-A', 'SSC-A', 'Ungated → Cells', None),
+            ('singlets', 'Singlets', ch['FSC-A'], ch['FSC-H'], 'FSC-A', 'FSC-H', 'Cells → Singlets', cells_m),
+            ('live', 'Live', ch['LiveDead'], ch['SSC-A'], 'Live/Dead', 'SSC-A', 'Singlets → Live', sing_m),
+            ('hcd45', 'hCD45+', ch['hCD45'], ch['SSC-A'], 'hCD45', 'SSC-A', 'Live → hCD45+', live_m),
+        ]
+        
+        stats = []
+        
+        # Affichage en grille 2x2
+        for row in range(2):
+            cols_display = st.columns(2)
+            for col_idx in range(2):
+                gate_idx = row * 2 + col_idx
+                if gate_idx >= len(gates_config):
+                    break
+                    
+                gkey, gname, x_ch, y_ch, x_label, y_label, title, parent_mask = gates_config[gate_idx]
+                
+                if polygons.get(gkey) is None and gkey != 'cells':
+                    continue
+                
+                with cols_display[col_idx]:
+                    st.markdown(f"### {gate_idx + 1}️⃣ {gname}")
+                    
+                    # Graphique
+                    fig, n_in, pct = create_interactive_plot(
+                        data, x_ch, y_ch, x_label, y_label, title,
+                        polygons.get(gkey), parent_mask, gname
+                    )
+                    st.plotly_chart(fig, use_container_width=True, key=f"plot_{gkey}")
+                    
+                    stats.append((gname, title.split('→')[0].strip() if '→' in title else 'Ungated', n_in, pct))
+                    
+                    # Panel d'édition
+                    if polygons.get(gkey):
+                        with st.expander(f"✏️ Modifier {gname}", expanded=False):
+                            poly = polygons[gkey]
+                            n_points = len(poly)
+                            
+                            # Sélection du point
+                            col_a, col_b = st.columns([1, 2])
+                            with col_a:
+                                point_idx = st.selectbox(
+                                    "Point",
+                                    range(n_points),
+                                    format_func=lambda x: f"Point {x+1}",
+                                    key=f"pt_sel_{gkey}"
+                                )
+                            
+                            with col_b:
+                                st.caption(f"Actuel: ({poly[point_idx][0]:.1f}, {poly[point_idx][1]:.1f})")
+                            
+                            # Nouvelles coordonnées
+                            col_x, col_y = st.columns(2)
+                            with col_x:
+                                new_x = st.number_input("X", value=float(poly[point_idx][0]), 
+                                                       step=1.0, key=f"nx_{gkey}")
+                            with col_y:
+                                new_y = st.number_input("Y", value=float(poly[point_idx][1]), 
+                                                       step=1.0, key=f"ny_{gkey}")
+                            
+                            col_btn1, col_btn2 = st.columns(2)
+                            with col_btn1:
+                                if st.button("✅ Appliquer", key=f"apply_{gkey}", use_container_width=True):
+                                    st.session_state.polygons[gkey] = move_point(poly, point_idx, new_x, new_y)
+                                    st.rerun()
+                            with col_btn2:
+                                if st.button("🔄 Reset point", key=f"reset_pt_{gkey}", use_container_width=True):
+                                    orig = st.session_state.original_polygons.get(gkey)
+                                    if orig and point_idx < len(orig):
+                                        st.session_state.polygons[gkey] = move_point(
+                                            poly, point_idx, orig[point_idx][0], orig[point_idx][1]
+                                        )
+                                        st.rerun()
+                            
+                            st.markdown("---")
+                            st.markdown("**Déplacer tout le gate:**")
+                            
+                            move_step = st.slider("Pas", 1, 20, 5, key=f"step_{gkey}")
+                            
+                            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                            with col_m1:
+                                if st.button("⬆️", key=f"up_{gkey}", use_container_width=True):
+                                    st.session_state.polygons[gkey] = move_polygon(poly, 0, move_step)
+                                    st.rerun()
+                            with col_m2:
+                                if st.button("⬇️", key=f"dn_{gkey}", use_container_width=True):
+                                    st.session_state.polygons[gkey] = move_polygon(poly, 0, -move_step)
+                                    st.rerun()
+                            with col_m3:
+                                if st.button("⬅️", key=f"lt_{gkey}", use_container_width=True):
+                                    st.session_state.polygons[gkey] = move_polygon(poly, -move_step, 0)
+                                    st.rerun()
+                            with col_m4:
+                                if st.button("➡️", key=f"rt_{gkey}", use_container_width=True):
+                                    st.session_state.polygons[gkey] = move_polygon(poly, move_step, 0)
+                                    st.rerun()
+                            
+                            col_s1, col_s2 = st.columns(2)
+                            with col_s1:
+                                if st.button("➕ Agrandir", key=f"grow_{gkey}", use_container_width=True):
+                                    st.session_state.polygons[gkey] = scale_polygon(poly, 1.1)
+                                    st.rerun()
+                            with col_s2:
+                                if st.button("➖ Réduire", key=f"shrink_{gkey}", use_container_width=True):
+                                    st.session_state.polygons[gkey] = scale_polygon(poly, 0.9)
+                                    st.rerun()
+        
+        st.markdown("---")
+        
+        # Actions globales
+        col_a, col_b, col_c = st.columns(3)
+        
+        with col_a:
+            if st.button("💾 Sauvegarder (apprentissage)", type="primary", use_container_width=True):
+                n_saved = 0
+                for gname in polygons:
+                    curr, orig = polygons.get(gname), st.session_state.original_polygons.get(gname)
+                    if curr and orig and list(curr) != list(orig):
+                        update_learned_params(gname, orig, curr)
+                        n_saved += 1
+                if n_saved:
+                    st.success(f"✅ {n_saved} correction(s) sauvegardée(s)!")
+                else:
+                    st.info("Aucune modification")
+        
+        with col_b:
+            if st.button("🔃 Réinitialiser tout", use_container_width=True):
+                st.session_state.polygons = {k: list(v) if v else None for k, v in st.session_state.original_polygons.items()}
+                st.rerun()
+        
+        with col_c:
+            if st.button("🔄 Rafraîchir", use_container_width=True):
+                st.rerun()
+        
+        # Résumé
+        st.markdown("### 📊 Résumé")
+        df = pd.DataFrame(stats, columns=['Population', 'Parent', 'Count', '% Parent'])
+        df['% Total'] = (df['Count'] / n_total * 100).round(2)
+        df['% Parent'] = df['% Parent'].round(1)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        
+        # Export
+        c1, c2 = st.columns(2)
+        c1.download_button("📥 CSV", df.to_csv(index=False), f"{reader.filename}.csv", "text/csv", use_container_width=True)
+        buf = io.BytesIO()
+        df.to_excel(buf, index=False, engine='openpyxl')
+        buf.seek(0)
+        c2.download_button("📥 Excel", buf, f"{reader.filename}.xlsx", use_container_width=True)
 
 else:
-    st.info("👆 Uploadez un fichier FCS pour commencer")
-    
     st.markdown("""
-    ### 📌 Comment utiliser cette application
-    
-    1. **Uploadez** votre fichier FCS
-    2. **Ajustez les gates** directement sur les graphiques :
-       - **Rectangles** : cliquez et glissez les bords/coins
-       - **Lignes de quadrant** : cliquez et glissez pour déplacer
-    3. **Visualisez** les statistiques mises à jour automatiquement
-    4. **Exportez** vos résultats en CSV ou Excel
-    """)
+    <div class="info-box">
+    <h3>🔬 Gates Polygonaux Interactifs</h3>
+    <p><b>Nouveautés v3:</b></p>
+    <ul>
+    <li>Gates en <b>polygones</b> (convex hull) au lieu de rectangles</li>
+    <li>Modification <b>point par point</b> des sommets</li>
+    <li>Déplacement et redimensionnement global</li>
+    <li>Apprentissage automatique des corrections</li>
+    </ul>
+    <p>Uploadez un fichier FCS pour commencer.</p>
+    </div>
+    """, unsafe_allow_html=True)
 
-# Footer
-st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: gray;'>
-    🔬 <b>FACS Analysis - Gates Interactifs</b><br>
-    Ajustez les gates directement sur les graphiques
-</div>
-""", unsafe_allow_html=True)
+st.caption(f"🔬 FACS Polygones Interactifs v3 | 🧠 {n_learned} corrections apprises")
