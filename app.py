@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-FACS Autogating - Version Complète avec Identification des Marqueurs
-- Détection automatique des marqueurs (CD4, CD8, CD3, FoxP3, etc.)
-- Grille de visualisations avec noms de marqueurs
-- Excel détaillé avec mapping Canal → Marqueur
+FACS Autogating - Style FlowJo
+Workflow immunophénotypage complet avec:
+- Gating hiérarchique (Cells → Single Cells → Live → hCD45+ → populations)
+- Quadrants pour sous-populations (T cells, B cells, NK cells, Treg)
+- Histogrammes pour marqueurs fonctionnels
+- Visualisation style FlowJo (pseudocolor, gates rectangulaires)
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
+import matplotlib.patches as patches
+from matplotlib.colors import LogNorm
 from pathlib import Path
 import tempfile
 import io
@@ -20,7 +23,7 @@ import re
 
 # Configuration
 st.set_page_config(
-    page_title="FACS Autogating - Marqueurs",
+    page_title="FACS - Style FlowJo",
     page_icon="🔬",
     layout="wide"
 )
@@ -28,109 +31,51 @@ st.set_page_config(
 # CSS
 st.markdown("""
     <style>
-    .main-header {
-        font-size: 2.5rem;
-        color: #1f77b4;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .info-box {
-        background-color: #e8f4f8;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 4px solid #1f77b4;
-        margin: 1rem 0;
-    }
-    .success-box {
-        background-color: #d4edda;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 4px solid #28a745;
-    }
+    .main-header { font-size: 2.2rem; color: #2c3e50; text-align: center; margin-bottom: 1rem; }
+    .population-box { background: #f8f9fa; padding: 0.5rem; border-radius: 0.3rem; 
+                      border-left: 3px solid #3498db; margin: 0.3rem 0; font-size: 0.9rem; }
+    .stats-table { font-size: 0.85rem; }
     </style>
 """, unsafe_allow_html=True)
 
 
-# Liste des marqueurs connus
-KNOWN_MARKERS = [
-    # Marqueurs T cells
-    'CD3', 'CD4', 'CD8', 'CD8a', 'CD8b',
-    # Marqueurs B cells
-    'CD19', 'CD20', 'CD21', 'CD22', 'CD27',
-    # Marqueurs NK
-    'CD16', 'CD56', 'CD57',
-    # Marqueurs d'activation
-    'CD25', 'CD69', 'CD38', 'CD137', 'CD154', 'CD107a', 'CD107b',
-    # Marqueurs mémoire/naïf
-    'CD45', 'CD45RA', 'CD45RO', 'CD62L', 'CCR7', 'CD127',
-    # Marqueurs Treg
-    'FoxP3', 'FOXP3', 'CD127',
-    # Checkpoint/exhaustion
-    'PD-1', 'PD1', 'PDCD1', 'CTLA-4', 'CTLA4', 'TIM-3', 'TIM3', 
-    'LAG-3', 'LAG3', 'TIGIT', 'BTLA',
-    # Marqueurs fonctionnels
-    'IFN-g', 'IFNg', 'IFN-gamma', 'TNF-a', 'TNFa', 'TNF-alpha',
-    'IL-2', 'IL2', 'IL-4', 'IL4', 'IL-10', 'IL10', 'IL-17', 'IL17',
-    'Granzyme', 'GranzymeB', 'GzmB', 'Perforin', 'Ki-67', 'Ki67',
-    # Autres
-    'HLA-DR', 'HLADR', 'HLA-A', 'HLA-B', 'HLA-C',
-    'CD161', 'CD183', 'CXCR3', 'CD185', 'CXCR5', 'CD194', 'CCR4',
-    'CD196', 'CCR6', 'CD197',
-    # Viabilité
-    'Live', 'Dead', 'Viability', 'Viab', '7-AAD', '7AAD', 'PI',
-    # Lignée
-    'CD14', 'CD33', 'CD11b', 'CD11c', 'CD123', 'CD303',
-    # Autres marqueurs courants
-    'PDL1', 'PD-L1', 'LLT1', 'NKG2D', 'NKp46',
-]
+# ==================== CHANNEL MAPPING ====================
+CHANNEL_MARKERS = {
+    'FSC-A': 'FSC-A',
+    'FSC-H': 'FSC-H', 
+    'SSC-A': 'SSC-A',
+    'BUV395-A': 'PDL1',
+    'BUV805-A': 'CD8',
+    'eFluor450-A': 'FoxP3',
+    'LiveDeadFixableAqua-A': 'Live/Dead',
+    'BV650-A': 'CD4',
+    'BV711-A': 'CD161',
+    'BV785-A': 'CD25',
+    '[RB780]-A': 'PD1',
+    'AF488-A': 'CD3',
+    'NovaFluorBlue585-A': 'CD16',
+    'PerCP-Vio700-A': 'CD107a',
+    'PerCP-A': 'hCD45',
+    'PE-A': 'LLT1',
+    'PE-Dazzle594-A': 'Granzyme B',
+    'PE-Fire700-A': 'CD19',
+    'PE-Cy7-A': 'CD56',
+    'APC-A': 'HLA-ABC',
+    'APC-Fire750-A': 'mCD45',
+}
 
 
-def extract_marker_from_text(text):
-    """Extrait le nom du marqueur depuis un texte (PnS ou PnN)"""
-    if not text or not isinstance(text, str):
-        return None
-    
-    text_upper = text.upper()
-    
-    # Patterns spécifiques pour extraire le marqueur
-    # Ex: "hCD4 : BV650 - Area" -> CD4
-    # Ex: "FoxP3 : eFluor450 - Area" -> FoxP3
-    
-    # Pattern 1: hXXX ou mXXX (human/mouse prefix)
-    match = re.search(r'[hm]?(CD\d+[a-zA-Z]?)', text, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    # Pattern 2: Chercher les marqueurs connus
-    for marker in KNOWN_MARKERS:
-        # Recherche exacte avec limites de mots
-        pattern = r'\b' + re.escape(marker) + r'\b'
-        if re.search(pattern, text, re.IGNORECASE):
-            return marker
-    
-    # Pattern 3: Extraire avant le ":"
-    if ':' in text:
-        before_colon = text.split(':')[0].strip()
-        # Nettoyer le préfixe h/m
-        cleaned = re.sub(r'^[hm]', '', before_colon, flags=re.IGNORECASE)
-        if cleaned and len(cleaned) > 1:
-            return cleaned
-    
-    return None
-
-
-class SimpleFCSReader:
+class FCSReader:
     def __init__(self, fcs_path):
         self.fcs_path = fcs_path
         self.flow_data = flowio.FlowData(fcs_path)
         self.data = None
         self.channels = []
-        self.channel_info = {}  # Mapping canal -> {marker, fluorochrome, pns}
+        self.channel_info = {}
         self.filename = Path(fcs_path).stem
         self.load_data()
     
     def load_data(self):
-        """Charge les données FCS en DataFrame avec extraction des marqueurs"""
         events = self.flow_data.events
         n_channels = self.flow_data.channel_count
         
@@ -143,427 +88,674 @@ class SimpleFCSReader:
         
         pnn_labels = []
         for i in range(1, n_channels + 1):
-            # Récupérer PnN (nom du canal)
-            pnn = self.flow_data.text.get(f'$P{i}N', None)
-            if pnn is None or pnn == f'Channel_{i}':
-                pnn = self.flow_data.text.get(f'p{i}n', f'Channel_{i}')
-            pnn = pnn.strip() if isinstance(pnn, str) else str(pnn)
-            
-            # Récupérer PnS (nom du stain/marqueur)
-            pns = self.flow_data.text.get(f'$P{i}S', None)
-            if pns is None:
-                pns = self.flow_data.text.get(f'p{i}s', '')
-            pns = pns.strip() if isinstance(pns, str) else str(pns)
+            pnn = self.flow_data.text.get(f'$P{i}N', None) or self.flow_data.text.get(f'p{i}n', f'Ch{i}')
+            pns = self.flow_data.text.get(f'$P{i}S', None) or self.flow_data.text.get(f'p{i}s', '')
+            pnn = pnn.strip() if pnn else f'Ch{i}'
+            pns = pns.strip() if pns else ''
             
             # Extraire le marqueur
-            marker = extract_marker_from_text(pns) or extract_marker_from_text(pnn)
+            marker = CHANNEL_MARKERS.get(pnn, None)
+            if not marker and pns:
+                # Extraire depuis PnS (ex: "hCD4 : BV650 - Area" -> CD4)
+                match = re.search(r'[hm]?(CD\d+[a-z]?|FoxP3|Granzyme|PD[L]?1|HLA)', pns, re.IGNORECASE)
+                if match:
+                    marker = match.group(0).replace('h', '').replace('m', '')
             
-            # Extraire le fluorochrome (depuis PnN généralement)
-            fluorochrome = pnn.replace('-A', '').replace('-H', '').replace('-W', '').strip()
-            
-            # Stocker les infos
-            self.channel_info[pnn] = {
-                'index': i,
-                'pnn': pnn,
-                'pns': pns,
-                'marker': marker,
-                'fluorochrome': fluorochrome,
-                'display_name': f"{marker} ({fluorochrome})" if marker else pnn
-            }
-            
+            self.channel_info[pnn] = {'pns': pns, 'marker': marker or pnn}
             pnn_labels.append(pnn)
         
         self.channels = pnn_labels
         self.data = pd.DataFrame(events, columns=self.channels)
         return self.data
     
-    def get_marker_for_channel(self, channel):
-        """Retourne le marqueur pour un canal donné"""
-        if channel in self.channel_info:
-            return self.channel_info[channel].get('marker', None)
-        return None
-    
-    def get_display_name(self, channel):
-        """Retourne le nom d'affichage (Marqueur + Fluorochrome)"""
-        if channel in self.channel_info:
-            return self.channel_info[channel].get('display_name', channel)
-        return channel
-    
-    def get_channels_with_markers(self):
-        """Retourne la liste des canaux qui ont un marqueur identifié"""
-        return [ch for ch, info in self.channel_info.items() if info.get('marker')]
-    
-    def get_info(self):
-        return {
-            'event_count': len(self.data),
-            'channel_count': len(self.channels),
-            'channels': self.channels,
-            'filename': self.filename,
-            'channel_info': self.channel_info
-        }
+    def get_marker(self, channel):
+        return self.channel_info.get(channel, {}).get('marker', channel)
 
 
-def gate_singlets_simple(data, fsc_a='FSC-A', fsc_h='FSC-H', threshold=1.5):
-    if fsc_a not in data.columns or fsc_h not in data.columns:
-        return pd.Series(True, index=data.index)
-    
-    ratio = data[fsc_h] / (data[fsc_a] + 1)
-    median_ratio = ratio.median()
-    mad = (ratio - median_ratio).abs().median()
-    
-    gate = (ratio > median_ratio - threshold * mad) & (ratio < median_ratio + threshold * mad)
-    return gate
+def find_channel(data, keywords):
+    """Trouve un canal par mots-clés"""
+    for col in data.columns:
+        col_upper = col.upper()
+        for kw in keywords:
+            if kw.upper() in col_upper:
+                return col
+    return None
 
 
-def gate_debris_simple(data, fsc='FSC-A', ssc='SSC-A', percentile=2):
-    if fsc not in data.columns or ssc not in data.columns:
-        return pd.Series(True, index=data.index)
-    
-    fsc_thresh = np.percentile(data[fsc], percentile)
-    ssc_thresh = np.percentile(data[ssc], percentile)
-    
-    gate = (data[fsc] > fsc_thresh) & (data[ssc] > ssc_thresh)
-    return gate
+def biex_transform(x, width=5, negative=0):
+    """Transformation biexponentielle simplifiée (style FlowJo)"""
+    x = np.asarray(x, dtype=float)
+    # Transformation asinh pour approximer biexponentielle
+    return np.arcsinh(x / 150) * 50
 
 
-def gate_positive_simple(data, channel, parent_gate=None):
-    """Gating positif/négatif avec KMeans"""
-    if channel not in data.columns:
-        return pd.Series(False, index=data.index), 0, {}
+def create_flowjo_plot(ax, x_data, y_data, x_label, y_label, title="", 
+                       gate_coords=None, gate_label=None, gate_pct=None,
+                       quadrant_coords=None, quadrant_labels=None, quadrant_pcts=None,
+                       show_stats=True, cmap='jet'):
+    """Crée un plot style FlowJo avec pseudocolor"""
     
-    from sklearn.cluster import KMeans
+    # Filtrer données valides
+    valid = np.isfinite(x_data) & np.isfinite(y_data)
+    x_plot = x_data[valid]
+    y_plot = y_data[valid]
     
-    if parent_gate is not None:
-        working_data = data[parent_gate]
-    else:
-        working_data = data
+    if len(x_plot) == 0:
+        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+        return
     
-    if len(working_data) < 100:
-        return pd.Series(False, index=data.index), 0, {}
+    # Transformation biexponentielle
+    x_trans = biex_transform(x_plot)
+    y_trans = biex_transform(y_plot)
     
-    X = working_data[channel].values.reshape(-1, 1)
-    
-    q1, q99 = np.percentile(X, [1, 99])
-    mask = (X >= q1) & (X <= q99)
-    X_filtered = X[mask.flatten()]
-    
-    if len(X_filtered) < 100:
-        return pd.Series(False, index=data.index), 0, {}
-    
-    kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
-    kmeans.fit(X_filtered)
-    
-    positive_cluster = np.argmax(kmeans.cluster_centers_)
-    labels = kmeans.predict(X)
-    
-    gate = pd.Series(False, index=data.index)
-    if parent_gate is not None:
-        gate.loc[parent_gate] = (labels == positive_cluster)
-    else:
-        gate = pd.Series(labels == positive_cluster, index=data.index)
-    
-    pos_count = gate.sum()
-    total_count = parent_gate.sum() if parent_gate is not None else len(data)
-    percentage = (pos_count / total_count * 100) if total_count > 0 else 0
-    
-    # Calculer MFI sur les cellules positives
+    # Plot pseudocolor (density)
     try:
-        if parent_gate is not None:
-            positive_cells = working_data.loc[gate[parent_gate], channel]
-        else:
-            positive_cells = working_data.loc[gate, channel]
-        
-        stats = {
-            'count': int(pos_count),
-            'percentage': round(percentage, 2),
-            'mean': round(float(positive_cells.mean()), 2) if len(positive_cells) > 0 else 0,
-            'median': round(float(positive_cells.median()), 2) if len(positive_cells) > 0 else 0,
-            'std': round(float(positive_cells.std()), 2) if len(positive_cells) > 0 else 0,
-        }
+        h = ax.hist2d(x_trans, y_trans, bins=100, cmap=cmap, norm=LogNorm(), 
+                     cmin=1, rasterized=True)
     except:
-        stats = {
-            'count': int(pos_count),
-            'percentage': round(percentage, 2),
-            'mean': 0, 'median': 0, 'std': 0
+        ax.scatter(x_trans, y_trans, s=1, c='blue', alpha=0.3, rasterized=True)
+    
+    # Gate rectangulaire
+    if gate_coords:
+        x1, y1, x2, y2 = gate_coords
+        x1_t, x2_t = biex_transform([x1, x2])
+        y1_t, y2_t = biex_transform([y1, y2])
+        rect = patches.Rectangle((x1_t, y1_t), x2_t-x1_t, y2_t-y1_t, 
+                                  linewidth=1.5, edgecolor='black', facecolor='none')
+        ax.add_patch(rect)
+        
+        if gate_label and gate_pct is not None:
+            ax.text(x2_t, y2_t, f'{gate_label}\n{gate_pct:.1f}%', 
+                   fontsize=8, va='bottom', ha='left')
+    
+    # Quadrants
+    if quadrant_coords:
+        x_mid, y_mid = quadrant_coords
+        x_mid_t = biex_transform([x_mid])[0]
+        y_mid_t = biex_transform([y_mid])[0]
+        
+        xlim = ax.get_xlim() if ax.get_xlim()[1] > ax.get_xlim()[0] else (x_trans.min(), x_trans.max())
+        ylim = ax.get_ylim() if ax.get_ylim()[1] > ax.get_ylim()[0] else (y_trans.min(), y_trans.max())
+        
+        ax.axhline(y=y_mid_t, color='black', linewidth=1, linestyle='-')
+        ax.axvline(x=x_mid_t, color='black', linewidth=1, linestyle='-')
+        
+        if quadrant_labels and quadrant_pcts:
+            # Q1: haut-droite, Q2: haut-gauche, Q3: bas-gauche, Q4: bas-droite
+            positions = [
+                (0.95, 0.95, 'right', 'top'),      # Q1: haut-droite
+                (0.05, 0.95, 'left', 'top'),       # Q2: haut-gauche  
+                (0.05, 0.05, 'left', 'bottom'),    # Q3: bas-gauche
+                (0.95, 0.05, 'right', 'bottom'),   # Q4: bas-droite
+            ]
+            for i, (label, pct) in enumerate(zip(quadrant_labels, quadrant_pcts)):
+                if i < len(positions):
+                    px, py, ha, va = positions[i]
+                    ax.text(px, py, f'{label}\n{pct:.1f}%', transform=ax.transAxes,
+                           fontsize=7, ha=ha, va=va, 
+                           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    ax.set_xlabel(x_label, fontsize=9)
+    ax.set_ylabel(y_label, fontsize=9)
+    if title:
+        ax.set_title(title, fontsize=10, fontweight='bold')
+
+
+def create_histogram(ax, data, channel, marker, gate_value=None, gate_label=None, gate_pct=None):
+    """Crée un histogramme style FlowJo"""
+    valid = np.isfinite(data) & (data > 0)
+    plot_data = biex_transform(data[valid])
+    
+    ax.hist(plot_data, bins=100, color='lightgray', edgecolor='darkgray', linewidth=0.5)
+    ax.fill_between(ax.get_xlim(), 0, ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else 100, alpha=0.3, color='lightgray')
+    
+    if gate_value is not None:
+        gate_t = biex_transform([gate_value])[0]
+        ax.axvline(x=gate_t, color='black', linewidth=1.5)
+        
+        if gate_label and gate_pct is not None:
+            ax.text(0.95, 0.95, f'{gate_label}\n{gate_pct:.1f}%', transform=ax.transAxes,
+                   fontsize=8, ha='right', va='top',
+                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    ax.set_xlabel(f'{marker} ({channel})', fontsize=9)
+    ax.set_ylabel('Count', fontsize=9)
+    ax.set_title(marker, fontsize=10, fontweight='bold')
+
+
+def run_flowjo_workflow(data, reader):
+    """Exécute le workflow FlowJo complet"""
+    
+    results = {'gates': {}, 'stats': [], 'populations': {}}
+    n_total = len(data)
+    
+    # ==================== ÉTAPE 1: CELLS ====================
+    fsc_a = find_channel(data, ['FSC-A'])
+    ssc_a = find_channel(data, ['SSC-A'])
+    
+    if fsc_a and ssc_a:
+        # Gate Cells (exclure débris - FSC et SSC bas)
+        fsc_thresh = np.percentile(data[fsc_a], 5)
+        ssc_thresh = np.percentile(data[ssc_a], 5)
+        fsc_max = np.percentile(data[fsc_a], 99)
+        ssc_max = np.percentile(data[ssc_a], 99)
+        
+        cells_gate = (data[fsc_a] > fsc_thresh) & (data[ssc_a] > ssc_thresh) & \
+                     (data[fsc_a] < fsc_max) & (data[ssc_a] < ssc_max)
+        
+        results['gates']['Cells'] = cells_gate
+        results['populations']['Cells'] = data[cells_gate]
+        n_cells = cells_gate.sum()
+        results['stats'].append({
+            'Population': 'Cells', 'Parent': 'Ungated', 
+            'Count': n_cells, '% Parent': round(n_cells/n_total*100, 1),
+            'Coords': (fsc_thresh, ssc_thresh, fsc_max, ssc_max)
+        })
+    else:
+        cells_gate = pd.Series(True, index=data.index)
+        results['gates']['Cells'] = cells_gate
+        n_cells = len(data)
+    
+    # ==================== ÉTAPE 2: SINGLE CELLS ====================
+    fsc_h = find_channel(data, ['FSC-H'])
+    
+    if fsc_a and fsc_h:
+        cells_data = data[cells_gate]
+        
+        # Gate singlets (ratio FSC-A/FSC-H)
+        ratio = cells_data[fsc_h] / (cells_data[fsc_a] + 1)
+        median_ratio = ratio.median()
+        mad = (ratio - median_ratio).abs().median()
+        
+        singlets_mask = (ratio > median_ratio - 2*mad) & (ratio < median_ratio + 2*mad)
+        
+        singlets_gate = pd.Series(False, index=data.index)
+        singlets_gate.loc[cells_gate] = singlets_mask.values
+        
+        results['gates']['Single Cells'] = singlets_gate
+        results['populations']['Single Cells'] = data[singlets_gate]
+        n_singlets = singlets_gate.sum()
+        results['stats'].append({
+            'Population': 'Single Cells', 'Parent': 'Cells',
+            'Count': n_singlets, '% Parent': round(n_singlets/n_cells*100, 1) if n_cells > 0 else 0
+        })
+    else:
+        singlets_gate = cells_gate.copy()
+        results['gates']['Single Cells'] = singlets_gate
+        n_singlets = singlets_gate.sum()
+    
+    # ==================== ÉTAPE 3: LIVE ====================
+    livedead = find_channel(data, ['LiveDead', 'Viab', 'Live'])
+    
+    if livedead:
+        singlets_data = data[singlets_gate]
+        
+        # Live = LiveDead négatif (bas)
+        ld_thresh = np.percentile(singlets_data[livedead], 85)  # 85% sont vivantes typiquement
+        
+        live_mask = singlets_data[livedead] < ld_thresh
+        
+        live_gate = pd.Series(False, index=data.index)
+        live_gate.loc[singlets_gate] = live_mask.values
+        
+        results['gates']['Live'] = live_gate
+        results['populations']['Live'] = data[live_gate]
+        n_live = live_gate.sum()
+        results['stats'].append({
+            'Population': 'Live', 'Parent': 'Single Cells',
+            'Count': n_live, '% Parent': round(n_live/n_singlets*100, 1) if n_singlets > 0 else 0,
+            'Threshold': ld_thresh
+        })
+    else:
+        live_gate = singlets_gate.copy()
+        results['gates']['Live'] = live_gate
+        n_live = live_gate.sum()
+    
+    # ==================== ÉTAPE 4: hCD45+ (Leucocytes humains) ====================
+    hcd45 = find_channel(data, ['PerCP-A', 'hCD45'])
+    mcd45 = find_channel(data, ['APC-Fire750', 'mCD45'])
+    
+    if hcd45:
+        live_data = data[live_gate]
+        
+        # hCD45 positif
+        hcd45_thresh = np.percentile(live_data[hcd45], 15)
+        
+        if mcd45:
+            # hCD45+ et mCD45-
+            mcd45_thresh = np.percentile(live_data[mcd45], 90)
+            leuco_mask = (live_data[hcd45] > hcd45_thresh) & (live_data[mcd45] < mcd45_thresh)
+        else:
+            leuco_mask = live_data[hcd45] > hcd45_thresh
+        
+        leuco_gate = pd.Series(False, index=data.index)
+        leuco_gate.loc[live_gate] = leuco_mask.values
+        
+        results['gates']['hCD45+'] = leuco_gate
+        results['populations']['hCD45+'] = data[leuco_gate]
+        n_leuco = leuco_gate.sum()
+        results['stats'].append({
+            'Population': 'hCD45+ (Leucocytes)', 'Parent': 'Live',
+            'Count': n_leuco, '% Parent': round(n_leuco/n_live*100, 1) if n_live > 0 else 0,
+            'Threshold': hcd45_thresh
+        })
+    else:
+        leuco_gate = live_gate.copy()
+        results['gates']['hCD45+'] = leuco_gate
+        n_leuco = leuco_gate.sum()
+    
+    # ==================== ÉTAPE 5: SOUS-POPULATIONS ====================
+    leuco_data = data[leuco_gate]
+    
+    # 5a. NK cells (CD56 vs CD16)
+    cd56 = find_channel(data, ['PE-Cy7', 'CD56'])
+    cd16 = find_channel(data, ['NovaFluor', 'CD16'])
+    
+    if cd56 and cd16 and len(leuco_data) > 0:
+        cd56_thresh = np.percentile(leuco_data[cd56], 60)
+        cd16_thresh = np.percentile(leuco_data[cd16], 60)
+        
+        nk_mask = (leuco_data[cd56] > cd56_thresh) | (leuco_data[cd16] > cd16_thresh)
+        nk_gate = pd.Series(False, index=data.index)
+        nk_gate.loc[leuco_gate] = nk_mask.values
+        
+        results['gates']['NK cells'] = nk_gate
+        n_nk = nk_gate.sum()
+        results['stats'].append({
+            'Population': 'NK cells', 'Parent': 'hCD45+',
+            'Count': n_nk, '% Parent': round(n_nk/n_leuco*100, 1) if n_leuco > 0 else 0
+        })
+        
+        # CD56+CD16+ quadrant
+        results['quadrants_nk'] = {
+            'thresholds': (cd56_thresh, cd16_thresh),
+            'labels': ['CD56+CD16+', 'CD56+CD16-', 'CD56-CD16-', 'CD56-CD16+']
         }
     
-    return gate, percentage, stats
+    # 5b. B cells vs T cells (CD19 vs CD3)
+    cd19 = find_channel(data, ['PE-Fire700', 'CD19'])
+    cd3 = find_channel(data, ['AF488', 'CD3'])
+    
+    if cd19 and cd3 and len(leuco_data) > 0:
+        cd19_thresh = np.percentile(leuco_data[cd19], 70)
+        cd3_thresh = np.percentile(leuco_data[cd3], 40)
+        
+        # B cells: CD19+ CD3-
+        b_mask = (leuco_data[cd19] > cd19_thresh) & (leuco_data[cd3] < cd3_thresh)
+        b_gate = pd.Series(False, index=data.index)
+        b_gate.loc[leuco_gate] = b_mask.values
+        results['gates']['B cells'] = b_gate
+        n_b = b_gate.sum()
+        
+        # T cells: CD19- CD3+
+        t_mask = (leuco_data[cd19] < cd19_thresh) & (leuco_data[cd3] > cd3_thresh)
+        t_gate = pd.Series(False, index=data.index)
+        t_gate.loc[leuco_gate] = t_mask.values
+        results['gates']['T cells'] = t_gate
+        results['populations']['T cells'] = data[t_gate]
+        n_t = t_gate.sum()
+        
+        results['stats'].append({
+            'Population': 'B cells', 'Parent': 'hCD45+',
+            'Count': n_b, '% Parent': round(n_b/n_leuco*100, 1) if n_leuco > 0 else 0
+        })
+        results['stats'].append({
+            'Population': 'T cells', 'Parent': 'hCD45+',
+            'Count': n_t, '% Parent': round(n_t/n_leuco*100, 1) if n_leuco > 0 else 0
+        })
+        
+        results['quadrants_bt'] = {
+            'thresholds': (cd3_thresh, cd19_thresh),
+            'labels': ['B cells', 'DP', 'T cells', 'CD19-CD3-']
+        }
+    
+    # 5c. CD4 vs CD8 (sur T cells)
+    cd4 = find_channel(data, ['BV650', 'CD4'])
+    cd8 = find_channel(data, ['BUV805', 'CD8'])
+    
+    if cd4 and cd8 and 'T cells' in results['gates']:
+        t_data = data[results['gates']['T cells']]
+        n_t = len(t_data)
+        
+        if n_t > 0:
+            cd4_thresh = np.percentile(t_data[cd4], 30)
+            cd8_thresh = np.percentile(t_data[cd8], 70)
+            
+            # CD4+ T cells
+            cd4_mask = (t_data[cd4] > cd4_thresh) & (t_data[cd8] < cd8_thresh)
+            cd4_gate = pd.Series(False, index=data.index)
+            cd4_gate.loc[results['gates']['T cells']] = cd4_mask.values
+            results['gates']['CD4+ T cells'] = cd4_gate
+            results['populations']['CD4+ T cells'] = data[cd4_gate]
+            n_cd4 = cd4_gate.sum()
+            
+            # CD8+ T cells
+            cd8_mask = (t_data[cd4] < cd4_thresh) & (t_data[cd8] > cd8_thresh)
+            cd8_gate = pd.Series(False, index=data.index)
+            cd8_gate.loc[results['gates']['T cells']] = cd8_mask.values
+            results['gates']['CD8+ T cells'] = cd8_gate
+            n_cd8 = cd8_gate.sum()
+            
+            results['stats'].append({
+                'Population': 'CD4+ T cells', 'Parent': 'T cells',
+                'Count': n_cd4, '% Parent': round(n_cd4/n_t*100, 1) if n_t > 0 else 0
+            })
+            results['stats'].append({
+                'Population': 'CD8+ T cells', 'Parent': 'T cells',
+                'Count': n_cd8, '% Parent': round(n_cd8/n_t*100, 1) if n_t > 0 else 0
+            })
+            
+            results['quadrants_cd4cd8'] = {
+                'thresholds': (cd4_thresh, cd8_thresh),
+                'labels': ['DP', 'CD8+', 'DN', 'CD4+']
+            }
+    
+    # 5d. Treg (FoxP3 vs CD25) sur CD4+ T cells
+    foxp3 = find_channel(data, ['eFluor450', 'FoxP3'])
+    cd25 = find_channel(data, ['BV785', 'CD25'])
+    
+    if foxp3 and cd25 and 'CD4+ T cells' in results['gates']:
+        cd4_data = data[results['gates']['CD4+ T cells']]
+        n_cd4 = len(cd4_data)
+        
+        if n_cd4 > 0:
+            foxp3_thresh = np.percentile(cd4_data[foxp3], 90)
+            cd25_thresh = np.percentile(cd4_data[cd25], 85)
+            
+            treg_mask = (cd4_data[foxp3] > foxp3_thresh) & (cd4_data[cd25] > cd25_thresh)
+            treg_gate = pd.Series(False, index=data.index)
+            treg_gate.loc[results['gates']['CD4+ T cells']] = treg_mask.values
+            results['gates']['Treg'] = treg_gate
+            n_treg = treg_gate.sum()
+            
+            results['stats'].append({
+                'Population': 'Treg (FoxP3+CD25+)', 'Parent': 'CD4+ T cells',
+                'Count': n_treg, '% Parent': round(n_treg/n_cd4*100, 1) if n_cd4 > 0 else 0
+            })
+            
+            results['quadrants_treg'] = {
+                'thresholds': (foxp3_thresh, cd25_thresh),
+                'labels': ['Treg', 'CD25+', 'FoxP3-CD25-', 'FoxP3+']
+            }
+    
+    # Marqueurs fonctionnels pour histogrammes
+    results['functional_markers'] = {
+        'PDL1': find_channel(data, ['BUV395', 'PDL1']),
+        'CD161': find_channel(data, ['BV711', 'CD161']),
+        'PD1': find_channel(data, ['RB780', 'PD1']),
+        'CD107a': find_channel(data, ['PerCP-Vio700', 'CD107a']),
+        'Granzyme B': find_channel(data, ['PE-Dazzle', 'Granzyme']),
+    }
+    
+    return results
 
 
-def create_multi_plot_figure(data, channels_pairs, gates, reader, log_scale=True, 
-                             xlims=None, ylims=None, ncols=3):
-    """Crée une figure avec plusieurs plots en grille avec noms de marqueurs"""
+def create_flowjo_figure(data, reader, results, xlims=None, ylims=None):
+    """Crée la figure complète style FlowJo"""
     
-    n_plots = len(channels_pairs)
-    if n_plots == 0:
-        return None
+    fig = plt.figure(figsize=(20, 16), dpi=100)
     
-    ncols = min(ncols, n_plots)
-    nrows = (n_plots + ncols - 1) // ncols
+    # Définir la grille (similaire à l'image FlowJo)
+    # Ligne 1: 6 plots (Cells, Single Cells, Live, hCD45, etc.)
+    # Ligne 2: 6 plots (sous-populations avec quadrants)
+    # Ligne 3: 6 histogrammes
     
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 5*nrows), dpi=120)
+    n_total = len(data)
     
-    if n_plots == 1:
-        axes = np.array([axes])
-    if nrows == 1 and ncols > 1:
-        axes = axes.reshape(1, -1)
-    axes = axes.flatten() if hasattr(axes, 'flatten') else [axes]
+    # ===== LIGNE 1: GATING PRINCIPAL =====
     
-    colors = ['red', 'green', 'blue', 'orange', 'purple', 'cyan', 'magenta', 'yellow']
+    # Plot 1: FSC-A vs SSC-A (Cells)
+    ax1 = fig.add_subplot(3, 6, 1)
+    fsc_a = find_channel(data, ['FSC-A'])
+    ssc_a = find_channel(data, ['SSC-A'])
+    if fsc_a and ssc_a:
+        gate_info = next((s for s in results['stats'] if s['Population'] == 'Cells'), None)
+        coords = gate_info.get('Coords') if gate_info else None
+        pct = gate_info['% Parent'] if gate_info else 0
+        create_flowjo_plot(ax1, data[fsc_a].values, data[ssc_a].values,
+                          'FSC-A', 'SSC-A', f'{reader.filename}\nUngated\n{n_total}',
+                          gate_coords=coords, gate_label='Cells', gate_pct=pct)
     
-    for idx, (x_ch, y_ch) in enumerate(channels_pairs):
-        if idx >= len(axes):
-            break
-        ax = axes[idx]
+    # Plot 2: FSC-A vs FSC-H (Single Cells)
+    ax2 = fig.add_subplot(3, 6, 2)
+    fsc_h = find_channel(data, ['FSC-H'])
+    if fsc_a and fsc_h and 'Cells' in results['gates']:
+        cells_data = data[results['gates']['Cells']]
+        gate_info = next((s for s in results['stats'] if s['Population'] == 'Single Cells'), None)
+        pct = gate_info['% Parent'] if gate_info else 0
+        n_cells = results['gates']['Cells'].sum()
+        create_flowjo_plot(ax2, cells_data[fsc_a].values, cells_data[fsc_h].values,
+                          'FSC-A', 'FSC-H', f'Cells\n{n_cells}',
+                          gate_label='Single Cells', gate_pct=pct)
+    
+    # Plot 3: Live/Dead vs SSC-A (Live)
+    ax3 = fig.add_subplot(3, 6, 3)
+    livedead = find_channel(data, ['LiveDead', 'Viab'])
+    if livedead and ssc_a and 'Single Cells' in results['gates']:
+        singlets_data = data[results['gates']['Single Cells']]
+        gate_info = next((s for s in results['stats'] if s['Population'] == 'Live'), None)
+        pct = gate_info['% Parent'] if gate_info else 0
+        n_sing = results['gates']['Single Cells'].sum()
+        create_flowjo_plot(ax3, singlets_data[livedead].values, singlets_data[ssc_a].values,
+                          'Live/Dead', 'SSC-A', f'Single Cells\n{n_sing}',
+                          gate_label='Live', gate_pct=pct)
+    
+    # Plot 4: hCD45 vs mCD45
+    ax4 = fig.add_subplot(3, 6, 4)
+    hcd45 = find_channel(data, ['PerCP-A'])
+    mcd45 = find_channel(data, ['APC-Fire750'])
+    if hcd45 and 'Live' in results['gates']:
+        live_data = data[results['gates']['Live']]
+        gate_info = next((s for s in results['stats'] if 'hCD45' in s['Population']), None)
+        pct = gate_info['% Parent'] if gate_info else 0
+        n_live = results['gates']['Live'].sum()
+        y_ch = mcd45 if mcd45 else ssc_a
+        create_flowjo_plot(ax4, live_data[hcd45].values, live_data[y_ch].values,
+                          'hCD45 (PerCP)', 'mCD45' if mcd45 else 'SSC-A', f'Live\n{n_live}',
+                          gate_label='hCD45+', gate_pct=pct)
+    
+    # Plot 5: HLA-ABC
+    ax5 = fig.add_subplot(3, 6, 5)
+    hla = find_channel(data, ['APC-A', 'HLA'])
+    if hla and hcd45 and 'hCD45+' in results['gates']:
+        leuco_data = data[results['gates']['hCD45+']]
+        n_leuco = len(leuco_data)
+        create_flowjo_plot(ax5, leuco_data[hcd45].values, leuco_data[hla].values,
+                          'hCD45', 'HLA-ABC', f'hCD45+\n{n_leuco}')
+    
+    # Plot 6: Leucocytes overview
+    ax6 = fig.add_subplot(3, 6, 6)
+    if hcd45 and 'hCD45+' in results['gates']:
+        leuco_data = data[results['gates']['hCD45+']]
+        n_leuco = len(leuco_data)
+        create_flowjo_plot(ax6, leuco_data[hcd45].values, leuco_data[ssc_a].values if ssc_a else leuco_data[hcd45].values,
+                          'hCD45', 'SSC-A', f'Leucocytes\n{n_leuco}')
+    
+    # ===== LIGNE 2: SOUS-POPULATIONS AVEC QUADRANTS =====
+    
+    # Plot 7: NK cells (CD56 vs CD16)
+    ax7 = fig.add_subplot(3, 6, 7)
+    cd56 = find_channel(data, ['PE-Cy7', 'CD56'])
+    cd16 = find_channel(data, ['NovaFluor', 'CD16'])
+    if cd56 and cd16 and 'hCD45+' in results['gates']:
+        leuco_data = data[results['gates']['hCD45+']]
+        n_leuco = len(leuco_data)
+        quad = results.get('quadrants_nk', {})
+        thresholds = quad.get('thresholds', (0, 0))
         
-        if x_ch not in data.columns or y_ch not in data.columns:
-            ax.text(0.5, 0.5, f'Canal non trouvé', ha='center', va='center', transform=ax.transAxes)
-            ax.set_title(f'{x_ch} vs {y_ch}')
-            continue
+        # Calculer pourcentages des quadrants
+        cd56_t, cd16_t = thresholds
+        q_pcts = []
+        for cond in [(True, True), (True, False), (False, False), (False, True)]:
+            cd56_cond = leuco_data[cd56] > cd56_t if cond[0] else leuco_data[cd56] <= cd56_t
+            cd16_cond = leuco_data[cd16] > cd16_t if cond[1] else leuco_data[cd16] <= cd16_t
+            q_pcts.append((cd56_cond & cd16_cond).sum() / n_leuco * 100 if n_leuco > 0 else 0)
         
-        x_data = data[x_ch].values.copy()
-        y_data = data[y_ch].values.copy()
+        create_flowjo_plot(ax7, leuco_data[cd16].values, leuco_data[cd56].values,
+                          'CD16', 'CD56', f'hCD45+\n{n_leuco}',
+                          quadrant_coords=thresholds[::-1],
+                          quadrant_labels=['NK cells', 'CD56+', 'DN', 'CD16+'],
+                          quadrant_pcts=q_pcts)
+    
+    # Plot 8: B cells vs T cells (CD19 vs CD3)
+    ax8 = fig.add_subplot(3, 6, 8)
+    cd19 = find_channel(data, ['PE-Fire700', 'CD19'])
+    cd3 = find_channel(data, ['AF488', 'CD3'])
+    if cd19 and cd3 and 'hCD45+' in results['gates']:
+        leuco_data = data[results['gates']['hCD45+']]
+        n_leuco = len(leuco_data)
+        quad = results.get('quadrants_bt', {})
+        thresholds = quad.get('thresholds', (0, 0))
         
-        valid_mask = (x_data > 0) & (y_data > 0) & np.isfinite(x_data) & np.isfinite(y_data)
-        x_plot = x_data[valid_mask]
-        y_plot = y_data[valid_mask]
+        cd3_t, cd19_t = thresholds
+        q_pcts = []
+        for cond in [(True, True), (False, True), (False, False), (True, False)]:
+            cd3_cond = leuco_data[cd3] > cd3_t if cond[0] else leuco_data[cd3] <= cd3_t
+            cd19_cond = leuco_data[cd19] > cd19_t if cond[1] else leuco_data[cd19] <= cd19_t
+            q_pcts.append((cd3_cond & cd19_cond).sum() / n_leuco * 100 if n_leuco > 0 else 0)
         
-        if log_scale:
-            x_plot = np.log10(x_plot + 1)
-            y_plot = np.log10(y_plot + 1)
+        create_flowjo_plot(ax8, leuco_data[cd3].values, leuco_data[cd19].values,
+                          'CD3', 'CD19', f'hCD45+\n{n_leuco}',
+                          quadrant_coords=thresholds,
+                          quadrant_labels=['B cells', 'DP', 'CD19-CD3-', 'T cells'],
+                          quadrant_pcts=q_pcts)
+    
+    # Plot 9: CD4 vs CD8
+    ax9 = fig.add_subplot(3, 6, 9)
+    cd4 = find_channel(data, ['BV650', 'CD4'])
+    cd8 = find_channel(data, ['BUV805', 'CD8'])
+    if cd4 and cd8 and 'T cells' in results['gates']:
+        t_data = data[results['gates']['T cells']]
+        n_t = len(t_data)
+        quad = results.get('quadrants_cd4cd8', {})
+        thresholds = quad.get('thresholds', (0, 0))
         
-        # Plot de fond (densité)
-        if len(x_plot) > 0:
-            ax.hexbin(x_plot, y_plot, gridsize=50, cmap='Greys', mincnt=1, alpha=0.5)
+        cd4_t, cd8_t = thresholds
+        q_pcts = []
+        for cond in [(True, True), (False, True), (False, False), (True, False)]:
+            cd4_cond = t_data[cd4] > cd4_t if cond[0] else t_data[cd4] <= cd4_t
+            cd8_cond = t_data[cd8] > cd8_t if cond[1] else t_data[cd8] <= cd8_t
+            q_pcts.append((cd4_cond & cd8_cond).sum() / n_t * 100 if n_t > 0 else 0)
         
-        # Overlay des gates
-        for g_idx, (gate_name, mask) in enumerate(gates.items()):
-            color = colors[g_idx % len(colors)]
+        create_flowjo_plot(ax9, t_data[cd4].values, t_data[cd8].values,
+                          'CD4', 'CD8', f'T cells\n{n_t}',
+                          quadrant_coords=thresholds,
+                          quadrant_labels=['DP', 'CD8+', 'DN', 'CD4+'],
+                          quadrant_pcts=q_pcts)
+    
+    # Plot 10: Treg (FoxP3 vs CD25)
+    ax10 = fig.add_subplot(3, 6, 10)
+    foxp3 = find_channel(data, ['eFluor450', 'FoxP3'])
+    cd25 = find_channel(data, ['BV785', 'CD25'])
+    if foxp3 and cd25 and 'CD4+ T cells' in results['gates']:
+        cd4_data = data[results['gates']['CD4+ T cells']]
+        n_cd4 = len(cd4_data)
+        quad = results.get('quadrants_treg', {})
+        thresholds = quad.get('thresholds', (0, 0))
+        
+        foxp3_t, cd25_t = thresholds
+        q_pcts = []
+        for cond in [(True, True), (False, True), (False, False), (True, False)]:
+            f_cond = cd4_data[foxp3] > foxp3_t if cond[0] else cd4_data[foxp3] <= foxp3_t
+            c_cond = cd4_data[cd25] > cd25_t if cond[1] else cd4_data[cd25] <= cd25_t
+            q_pcts.append((f_cond & c_cond).sum() / n_cd4 * 100 if n_cd4 > 0 else 0)
+        
+        create_flowjo_plot(ax10, cd4_data[foxp3].values, cd4_data[cd25].values,
+                          'FoxP3', 'CD25', f'CD4+ T cells\n{n_cd4}',
+                          quadrant_coords=thresholds,
+                          quadrant_labels=['Treg', 'CD25+', 'DN', 'FoxP3+'],
+                          quadrant_pcts=q_pcts)
+    
+    # Plots 11-12: Espaces pour autres populations
+    ax11 = fig.add_subplot(3, 6, 11)
+    ax11.axis('off')
+    ax12 = fig.add_subplot(3, 6, 12)
+    ax12.axis('off')
+    
+    # ===== LIGNE 3: HISTOGRAMMES =====
+    functional = results.get('functional_markers', {})
+    hist_population = 'B cells' if 'B cells' in results['gates'] else 'hCD45+'
+    hist_data = data[results['gates'].get(hist_population, results['gates'].get('hCD45+', pd.Series(True, index=data.index)))]
+    n_hist = len(hist_data)
+    
+    hist_idx = 13
+    for marker_name, channel in functional.items():
+        if channel and hist_idx <= 18:
+            ax = fig.add_subplot(3, 6, hist_idx)
             
-            mask_array = mask.values.astype(bool) if hasattr(mask, 'values') else np.array(mask, dtype=bool)
-            mask_valid = mask_array[valid_mask].astype(bool)
+            if channel in hist_data.columns:
+                marker_data = hist_data[channel].values
+                valid = np.isfinite(marker_data) & (marker_data > 0)
+                
+                if valid.sum() > 0:
+                    # Calculer % positif
+                    thresh = np.percentile(marker_data[valid], 85)
+                    pct_pos = (marker_data > thresh).sum() / len(marker_data) * 100
+                    
+                    create_histogram(ax, marker_data, channel, marker_name,
+                                   gate_value=thresh, gate_label=f'{marker_name}+', gate_pct=pct_pos)
+                    ax.set_title(f'{hist_population}\n{n_hist}', fontsize=9)
             
-            if mask_valid.sum() > 0:
-                ax.scatter(x_plot[mask_valid], y_plot[mask_valid], 
-                          s=1, c=color, alpha=0.4, label=f"{gate_name}", rasterized=True)
-        
-        # Limites d'axes
-        if xlims and idx < len(xlims) and xlims[idx]:
-            ax.set_xlim(xlims[idx])
-        if ylims and idx < len(ylims) and ylims[idx]:
-            ax.set_ylim(ylims[idx])
-        
-        # Labels avec noms de marqueurs
-        x_display = reader.get_display_name(x_ch)
-        y_display = reader.get_display_name(y_ch)
-        
-        ax.set_xlabel(x_display, fontsize=9, fontweight='bold')
-        ax.set_ylabel(y_display, fontsize=9, fontweight='bold')
-        ax.set_title(f'{x_display}\nvs {y_display}', fontsize=10, fontweight='bold')
-        ax.grid(True, alpha=0.3, linestyle='--')
-        
-        if idx == 0 and gates:
-            ax.legend(loc='upper right', fontsize=7, markerscale=3)
+            hist_idx += 1
     
-    # Masquer les axes inutilisés
-    for idx in range(n_plots, len(axes)):
-        axes[idx].set_visible(False)
+    # Cacher les axes non utilisés
+    for i in range(hist_idx, 19):
+        ax = fig.add_subplot(3, 6, i)
+        ax.axis('off')
     
     plt.tight_layout()
     return fig
 
 
-def export_complete_excel(reader, gates, marker_stats, filename):
-    """Export Excel complet avec mapping Canal → Marqueur"""
+def export_flowjo_excel(reader, results):
+    """Export Excel style FlowJo"""
     try:
         import openpyxl
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-        from openpyxl.utils.dataframe import dataframe_to_rows
-    except ImportError:
+        from openpyxl.styles import Font, PatternFill, Alignment
+    except:
         return None
     
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
     
     # Styles
-    header_font = Font(bold=True, color="FFFFFF", size=11)
-    header_fill_blue = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    header_fill_green = PatternFill(start_color="70AD47", end_color="70AD47", fill_type="solid")
-    header_fill_orange = PatternFill(start_color="ED7D31", end_color="ED7D31", fill_type="solid")
-    header_fill_purple = PatternFill(start_color="7030A0", end_color="7030A0", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="4472C4", fill_type="solid")
     
-    # ==================== FEUILLE 1 : RÉSUMÉ ====================
-    ws_summary = wb.create_sheet("Résumé")
+    # Feuille Statistiques
+    ws = wb.create_sheet("Population Statistics")
+    headers = ['Population', 'Parent', 'Count', '% of Parent', '% of Total']
+    ws.append(headers)
     
-    summary_data = [
-        ['RÉSUMÉ DE L\'ANALYSE FACS'],
-        [''],
-        ['Paramètre', 'Valeur'],
-        ['Fichier', reader.filename],
-        ['Date d\'analyse', datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-        ['Événements totaux', len(reader.data)],
-        ['Nombre de canaux', len(reader.channels)],
-        ['Marqueurs identifiés', len([c for c in reader.channel_info.values() if c.get('marker')])],
-        ['Populations identifiées', len(gates)],
-    ]
-    
-    for r_idx, row in enumerate(summary_data, 1):
-        for c_idx, value in enumerate(row, 1):
-            cell = ws_summary.cell(row=r_idx, column=c_idx, value=value)
-            if r_idx == 1:
-                cell.font = Font(bold=True, size=14, color="4472C4")
-            elif r_idx == 3:
-                cell.font = header_font
-                cell.fill = header_fill_blue
-    
-    # ==================== FEUILLE 2 : MAPPING CANAUX → MARQUEURS ====================
-    ws_mapping = wb.create_sheet("Mapping_Canaux_Marqueurs")
-    
-    mapping_headers = ['Index', 'Canal (Fluorochrome)', 'Marqueur', 'Description Complète', 'Type']
-    ws_mapping.append(mapping_headers)
-    
-    for c_idx, header in enumerate(mapping_headers, 1):
-        cell = ws_mapping.cell(row=1, column=c_idx)
+    for c_idx, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=c_idx)
         cell.font = header_font
-        cell.fill = header_fill_purple
-        cell.alignment = Alignment(horizontal='center')
+        cell.fill = header_fill
     
-    for ch, info in reader.channel_info.items():
-        marker = info.get('marker', '-')
-        pns = info.get('pns', '')
-        
-        # Déterminer le type
-        if 'FSC' in ch.upper() or 'SSC' in ch.upper():
-            ch_type = 'Scatter'
-        elif 'TIME' in ch.upper():
-            ch_type = 'Time'
-        elif marker and marker != '-':
-            ch_type = 'Marqueur'
-        else:
-            ch_type = 'Fluorescence'
-        
-        ws_mapping.append([
-            info.get('index', ''),
-            ch,
-            marker if marker else '-',
-            pns,
-            ch_type
+    n_total = len(reader.data)
+    for stat in results['stats']:
+        ws.append([
+            stat['Population'],
+            stat['Parent'],
+            stat['Count'],
+            f"{stat['% Parent']}%",
+            f"{round(stat['Count']/n_total*100, 2)}%"
         ])
     
-    # ==================== FEUILLE 3 : STATISTIQUES PAR MARQUEUR ====================
-    ws_markers = wb.create_sheet("Statistiques_Marqueurs")
+    # Feuille Marqueurs
+    ws2 = wb.create_sheet("Marker Summary")
+    ws2.append(['Marker', 'Channel', 'Population', '% Positive'])
     
-    marker_headers = ['Marqueur', 'Canal', '% Positif', 'Count', 'MFI Mean', 'MFI Median', 'MFI Std', 'Population Parent']
-    ws_markers.append(marker_headers)
-    
-    for c_idx, header in enumerate(marker_headers, 1):
-        cell = ws_markers.cell(row=1, column=c_idx)
+    for c_idx in range(1, 5):
+        cell = ws2.cell(row=1, column=c_idx)
         cell.font = header_font
-        cell.fill = header_fill_green
-        cell.alignment = Alignment(horizontal='center')
+        cell.fill = header_fill
     
-    for channel, stats in marker_stats.items():
-        marker = reader.get_marker_for_channel(channel)
-        ws_markers.append([
-            marker if marker else channel,
-            channel,
-            f"{stats.get('percentage', 0)}%",
-            stats.get('count', 0),
-            stats.get('mean', 0),
-            stats.get('median', 0),
-            stats.get('std', 0),
-            stats.get('parent', 'viable')
-        ])
-    
-    # ==================== FEUILLE 4 : TABLEAU RÉCAPITULATIF (FORMAT PUBLICATION) ====================
-    ws_recap = wb.create_sheet("Tableau_Publication")
-    
-    ws_recap.append(['TABLEAU RÉCAPITULATIF - FORMAT PUBLICATION'])
-    ws_recap.cell(row=1, column=1).font = Font(bold=True, size=14, color="4472C4")
-    ws_recap.append([''])
-    ws_recap.append(['Échantillon:', reader.filename])
-    ws_recap.append(['Date:', datetime.now().strftime("%Y-%m-%d")])
-    ws_recap.append([''])
-    
-    recap_headers = ['Marqueur', 'Fluorochrome', '% Positif', 'MFI']
-    ws_recap.append(recap_headers)
-    
-    for c_idx, header in enumerate(recap_headers, 1):
-        cell = ws_recap.cell(row=6, column=c_idx)
-        cell.font = header_font
-        cell.fill = header_fill_orange
-        cell.alignment = Alignment(horizontal='center')
-    
-    row_idx = 7
-    for channel, stats in marker_stats.items():
-        marker = reader.get_marker_for_channel(channel)
-        fluoro = reader.channel_info.get(channel, {}).get('fluorochrome', channel)
-        
-        ws_recap.cell(row=row_idx, column=1, value=marker if marker else '-')
-        ws_recap.cell(row=row_idx, column=2, value=fluoro)
-        ws_recap.cell(row=row_idx, column=3, value=f"{stats.get('percentage', 0)}%")
-        ws_recap.cell(row=row_idx, column=4, value=stats.get('mean', 0))
-        row_idx += 1
-    
-    # ==================== FEUILLE 5 : STATISTIQUES POPULATIONS ====================
-    ws_stats = wb.create_sheet("Statistiques_Populations")
-    
-    pop_headers = ['Population', 'Nombre', '% du Total']
-    ws_stats.append(pop_headers)
-    
-    for c_idx, header in enumerate(pop_headers, 1):
-        cell = ws_stats.cell(row=1, column=c_idx)
-        cell.font = header_font
-        cell.fill = header_fill_blue
-    
-    total_events = len(reader.data)
-    for gate_name, mask in gates.items():
-        if '_pos' not in gate_name:
-            count = int(mask.sum())
-            pct = round((count / total_events) * 100, 2)
-            ws_stats.append([gate_name, count, f"{pct}%"])
-    
-    # ==================== FEUILLE 6 : DONNÉES ÉCHANTILLON ====================
-    ws_data = wb.create_sheet("Donnees_Echantillon")
-    
-    # Créer les en-têtes avec marqueurs
-    sample_data = reader.data.head(500).copy()
-    
-    # Renommer les colonnes avec les marqueurs
-    new_columns = []
-    for col in sample_data.columns:
-        marker = reader.get_marker_for_channel(col)
-        if marker:
-            new_columns.append(f"{marker} ({col})")
-        else:
-            new_columns.append(col)
-    sample_data.columns = new_columns
-    
-    # Ajouter colonnes de gates
-    for gate_name, mask in gates.items():
-        if '_pos' not in gate_name:
-            sample_data[f'Gate_{gate_name}'] = mask.head(500).astype(int)
-    
-    for r_idx, row in enumerate(dataframe_to_rows(sample_data, index=False, header=True), 1):
-        for c_idx, value in enumerate(row, 1):
-            cell = ws_data.cell(row=r_idx, column=c_idx, value=value)
-            if r_idx == 1:
-                cell.font = Font(bold=True, size=9)
-                cell.fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-    
-    # Ajuster largeurs de colonnes
+    # Ajuster largeurs
     for ws in wb.worksheets:
-        for column in ws.columns:
-            max_length = 0
-            column_letter = column[0].column_letter
-            for cell in column:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-            adjusted_width = min(max_length + 2, 40)
-            ws.column_dimensions[column_letter].width = adjusted_width
+        for col in ws.columns:
+            max_len = max(len(str(cell.value or '')) for cell in col)
+            ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 30)
     
     output = io.BytesIO()
     wb.save(output)
@@ -573,355 +765,73 @@ def export_complete_excel(reader, gates, marker_stats, filename):
 
 # ==================== INTERFACE STREAMLIT ====================
 
-st.markdown('<h1 class="main-header">🔬 FACS Autogating - Identification des Marqueurs</h1>', unsafe_allow_html=True)
-st.markdown("---")
+st.markdown('<h1 class="main-header">🔬 FACS Analysis - FlowJo Style</h1>', unsafe_allow_html=True)
 
 # Sidebar
 with st.sidebar:
-    st.markdown("## 🎯 Configuration")
-    
-    st.markdown("### ⚙️ Gating")
-    gate_singlets = st.checkbox("Gate Singlets", value=True)
-    gate_debris = st.checkbox("Supprimer Débris", value=True)
-    
-    st.markdown("### 🎨 Visualisation")
-    log_scale = st.checkbox("Échelle log", value=True)
-    ncols = st.slider("Colonnes par ligne", 2, 4, 3)
-    
-    st.markdown("### 📊 Analyse")
-    analyze_all_markers = st.checkbox("Analyser tous les marqueurs", value=True)
-
-# Session state
-if 'reader' not in st.session_state:
-    st.session_state.reader = None
-if 'gates' not in st.session_state:
-    st.session_state.gates = {}
-if 'marker_stats' not in st.session_state:
-    st.session_state.marker_stats = {}
-if 'analysis_done' not in st.session_state:
-    st.session_state.analysis_done = False
+    st.markdown("### ⚙️ Options")
+    auto_gate = st.checkbox("Gating automatique", value=True)
+    show_stats = st.checkbox("Afficher statistiques", value=True)
 
 # Upload
-st.markdown("### 📁 Upload Fichier FCS")
-uploaded_file = st.file_uploader("Sélectionner un fichier FCS", type=['fcs'])
+uploaded_file = st.file_uploader("📁 Fichier FCS", type=['fcs'])
 
-if uploaded_file is not None:
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.fcs') as tmp_file:
-        tmp_file.write(uploaded_file.read())
-        tmp_path = tmp_file.name
-    
-    st.markdown(f'<div class="info-box">📄 <b>{uploaded_file.name}</b></div>', unsafe_allow_html=True)
+if uploaded_file:
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.fcs') as tmp:
+        tmp.write(uploaded_file.read())
+        tmp_path = tmp.name
     
     try:
-        with st.spinner("Chargement et identification des marqueurs..."):
-            reader = SimpleFCSReader(tmp_path)
-            st.session_state.reader = reader
+        with st.spinner("Chargement..."):
+            reader = FCSReader(tmp_path)
         
-        info = reader.get_info()
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Événements", f"{len(reader.data):,}")
+        col2.metric("Canaux", len(reader.channels))
+        col3.metric("Fichier", reader.filename[:20])
         
-        # Métriques
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Événements", f"{info['event_count']:,}")
-        with col2:
-            st.metric("Canaux", info['channel_count'])
-        with col3:
-            markers_found = len([c for c in info['channel_info'].values() if c.get('marker')])
-            st.metric("Marqueurs ID", markers_found)
-        with col4:
-            st.metric("Taille", f"{uploaded_file.size / 1024 / 1024:.1f} MB")
+        if st.button("🚀 Analyser (Workflow FlowJo)", type="primary", use_container_width=True):
+            with st.spinner("Analyse du workflow..."):
+                results = run_flowjo_workflow(reader.data, reader)
+                st.session_state.results = results
+                st.session_state.reader = reader
         
-        # Afficher les marqueurs identifiés
-        with st.expander("🔬 Marqueurs Identifiés", expanded=True):
-            marker_list = []
-            for ch, info_ch in reader.channel_info.items():
-                if info_ch.get('marker'):
-                    marker_list.append({
-                        'Canal': ch,
-                        'Marqueur': info_ch['marker'],
-                        'Description': info_ch.get('pns', '')
-                    })
+        if 'results' in st.session_state:
+            results = st.session_state.results
+            reader = st.session_state.reader
             
-            if marker_list:
-                st.dataframe(pd.DataFrame(marker_list), use_container_width=True, height=200)
-            else:
-                st.warning("Aucun marqueur identifié automatiquement.")
-        
-        # Bouton Analyser
-        if st.button("🚀 Analyser", type="primary", use_container_width=True):
-            with st.spinner("Analyse en cours..."):
-                data = reader.data
-                gates = {}
-                marker_stats = {}
-                
-                # Gate Singlets
-                if gate_singlets:
-                    fsc_a = [c for c in data.columns if 'FSC' in c.upper() and '-A' in c.upper()]
-                    fsc_h = [c for c in data.columns if 'FSC' in c.upper() and '-H' in c.upper()]
-                    
-                    if fsc_a and fsc_h:
-                        gates['singlets'] = gate_singlets_simple(data, fsc_a[0], fsc_h[0])
-                        st.success(f"✅ Singlets : {gates['singlets'].sum():,} ({gates['singlets'].sum()/len(data)*100:.1f}%)")
-                
-                # Gate Débris
-                if gate_debris:
-                    fsc_a = [c for c in data.columns if 'FSC' in c.upper() and '-A' in c.upper()]
-                    ssc_a = [c for c in data.columns if 'SSC' in c.upper() and '-A' in c.upper()]
-                    
-                    if fsc_a and ssc_a:
-                        parent = gates.get('singlets', pd.Series(True, index=data.index))
-                        debris_gate = gate_debris_simple(data, fsc_a[0], ssc_a[0])
-                        gates['viable'] = parent & debris_gate
-                        st.success(f"✅ Viables : {gates['viable'].sum():,} ({gates['viable'].sum()/len(data)*100:.1f}%)")
-                
-                # Analyser les marqueurs
-                channels_with_markers = reader.get_channels_with_markers()
-                
-                if channels_with_markers:
-                    st.info(f"🔍 Analyse de {len(channels_with_markers)} marqueurs...")
-                    
-                    parent_gate = gates.get('viable', gates.get('singlets', pd.Series(True, index=data.index)))
-                    
-                    progress_bar = st.progress(0)
-                    
-                    for i, channel in enumerate(channels_with_markers):
-                        try:
-                            gate, pct, stats = gate_positive_simple(data, channel, parent_gate)
-                            
-                            if stats and stats.get('count', 0) > 0:
-                                marker = reader.get_marker_for_channel(channel)
-                                gates[f'{marker}_pos'] = gate
-                                stats['parent'] = 'viable' if 'viable' in gates else 'singlets'
-                                stats['marker'] = marker
-                                marker_stats[channel] = stats
-                        except Exception as e:
-                            pass
-                        
-                        progress_bar.progress((i + 1) / len(channels_with_markers))
-                    
-                    progress_bar.empty()
-                    st.success(f"✅ {len(marker_stats)} marqueurs analysés")
-                
-                st.session_state.gates = gates
-                st.session_state.marker_stats = marker_stats
-                st.session_state.analysis_done = True
-                
-                st.markdown('<div class="success-box">✅ Analyse terminée !</div>', unsafe_allow_html=True)
-        
-        # Résultats
-        if st.session_state.analysis_done:
-            st.markdown("---")
-            st.markdown("### 📊 Résultats")
+            # Statistiques
+            if show_stats:
+                st.markdown("### 📊 Populations")
+                stats_df = pd.DataFrame(results['stats'])
+                st.dataframe(stats_df, use_container_width=True)
             
-            tab1, tab2, tab3, tab4 = st.tabs([
-                "📈 Statistiques", 
-                "🎨 Visualisations", 
-                "🔬 Marqueurs",
-                "💾 Export"
-            ])
+            # Figure FlowJo
+            st.markdown("### 🎨 Visualisation FlowJo")
             
-            # TAB 1 : STATISTIQUES
-            with tab1:
-                st.markdown("#### Populations Principales")
-                
-                stats_data = []
-                total = len(reader.data)
-                
-                for gate_name, mask in st.session_state.gates.items():
-                    if '_pos' not in gate_name:
-                        stats_data.append({
-                            'Population': gate_name,
-                            'Nombre': int(mask.sum()),
-                            '% Total': f"{(mask.sum() / total) * 100:.1f}%"
-                        })
-                
-                st.dataframe(pd.DataFrame(stats_data), use_container_width=True)
+            with st.spinner("Génération des graphiques..."):
+                fig = create_flowjo_figure(reader.data, reader, results)
+                st.pyplot(fig)
+                st.session_state.fig = fig
             
-            # TAB 2 : VISUALISATIONS
-            with tab2:
-                st.markdown("#### 🎨 Grille de Visualisations avec Marqueurs")
-                
-                all_channels = reader.channels
-                
-                # Canaux scatter
-                fsc_a = [c for c in all_channels if 'FSC' in c.upper() and '-A' in c.upper()]
-                ssc_a = [c for c in all_channels if 'SSC' in c.upper() and '-A' in c.upper()]
-                fsc_h = [c for c in all_channels if 'FSC' in c.upper() and '-H' in c.upper()]
-                
-                # Paires par défaut
-                default_pairs = []
-                if fsc_a and ssc_a:
-                    default_pairs.append((fsc_a[0], ssc_a[0]))
-                if fsc_a and fsc_h:
-                    default_pairs.append((fsc_a[0], fsc_h[0]))
-                
-                # Ajouter les canaux avec marqueurs
-                marker_channels = reader.get_channels_with_markers()
-                for ch in marker_channels[:6]:
-                    if ssc_a:
-                        default_pairs.append((ch, ssc_a[0]))
-                
-                # Contrôles
-                col1, col2 = st.columns(2)
-                with col1:
-                    n_plots = st.slider("Nombre de graphiques", 1, 12, min(6, len(default_pairs)))
-                
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    x_min = st.number_input("X min", value=0.0, step=0.5)
-                with col2:
-                    x_max = st.number_input("X max", value=6.0, step=0.5)
-                with col3:
-                    y_min = st.number_input("Y min", value=0.0, step=0.5)
-                with col4:
-                    y_max = st.number_input("Y max", value=6.0, step=0.5)
-                
-                use_custom_limits = st.checkbox("Appliquer limites personnalisées", value=False)
-                
-                if st.button("📊 Générer la grille", type="primary"):
-                    with st.spinner("Génération..."):
-                        pairs_to_plot = default_pairs[:n_plots]
-                        
-                        xlims = [(x_min, x_max)] * n_plots if use_custom_limits else None
-                        ylims = [(y_min, y_max)] * n_plots if use_custom_limits else None
-                        
-                        display_gates = {k: v for k, v in st.session_state.gates.items() 
-                                        if k in ['singlets', 'viable']}
-                        
-                        fig = create_multi_plot_figure(
-                            reader.data, pairs_to_plot, display_gates, reader,
-                            log_scale=log_scale, xlims=xlims, ylims=ylims, ncols=ncols
-                        )
-                        
-                        if fig:
-                            st.pyplot(fig)
-                            st.session_state.grid_figure = fig
-                
-                if 'grid_figure' in st.session_state and st.session_state.grid_figure:
+            # Export
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("📥 Export PNG (300 DPI)"):
                     buf = io.BytesIO()
-                    st.session_state.grid_figure.savefig(buf, format='png', dpi=300, bbox_inches='tight')
+                    st.session_state.fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
                     buf.seek(0)
-                    
-                    st.download_button(
-                        "📥 Télécharger Grille (PNG 300 DPI)",
-                        buf,
-                        f"grille_{reader.filename}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                        "image/png",
-                        use_container_width=True
-                    )
+                    st.download_button("Télécharger", buf, f"{reader.filename}_flowjo.png", "image/png")
             
-            # TAB 3 : MARQUEURS DÉTAILLÉS
-            with tab3:
-                st.markdown("#### 🔬 Statistiques par Marqueur")
-                
-                if st.session_state.marker_stats:
-                    marker_df = pd.DataFrame([
-                        {
-                            'Marqueur': reader.get_marker_for_channel(channel) or channel,
-                            'Canal': channel,
-                            '% Positif': f"{stats['percentage']}%",
-                            'Count': stats['count'],
-                            'MFI Mean': stats['mean'],
-                            'MFI Median': stats['median']
-                        }
-                        for channel, stats in st.session_state.marker_stats.items()
-                    ])
-                    
-                    # Trier par pourcentage
-                    marker_df['pct_sort'] = marker_df['% Positif'].str.replace('%', '').astype(float)
-                    marker_df = marker_df.sort_values('pct_sort', ascending=False).drop('pct_sort', axis=1)
-                    
-                    st.dataframe(marker_df, use_container_width=True, height=400)
-                    
-                    # Graphique
-                    st.markdown("##### Distribution des % Positifs par Marqueur")
-                    
-                    fig, ax = plt.subplots(figsize=(12, max(6, len(marker_df) * 0.4)))
-                    
-                    markers = marker_df['Marqueur'].tolist()
-                    percentages = [float(p.replace('%', '')) for p in marker_df['% Positif'].tolist()]
-                    
-                    colors = plt.cm.RdYlGn(np.array(percentages) / 100)
-                    
-                    bars = ax.barh(range(len(markers)), percentages, color=colors)
-                    ax.set_yticks(range(len(markers)))
-                    ax.set_yticklabels(markers, fontsize=10)
-                    ax.set_xlabel('% Positif', fontsize=12)
-                    ax.set_title('Pourcentage de Cellules Positives par Marqueur', fontsize=14, fontweight='bold')
-                    ax.grid(axis='x', alpha=0.3)
-                    ax.invert_yaxis()
-                    
-                    # Ajouter les valeurs sur les barres
-                    for i, (bar, pct) in enumerate(zip(bars, percentages)):
-                        ax.text(bar.get_width() + 0.5, bar.get_y() + bar.get_height()/2, 
-                               f'{pct:.1f}%', va='center', fontsize=9)
-                    
-                    plt.tight_layout()
-                    st.pyplot(fig)
-            
-            # TAB 4 : EXPORT
-            with tab4:
-                st.markdown("#### 💾 Export Complet")
-                
-                st.info("📦 L'export Excel inclut :\n"
-                       "- **Mapping Canaux → Marqueurs** (CD4, CD8, CD3, etc.)\n"
-                       "- Statistiques par marqueur (%, MFI)\n"
-                       "- Tableau format publication\n"
-                       "- Données avec noms de marqueurs")
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    if st.button("📊 Générer Excel Complet", type="primary", use_container_width=True):
-                        with st.spinner("Génération..."):
-                            excel_data = export_complete_excel(
-                                reader, 
-                                st.session_state.gates, 
-                                st.session_state.marker_stats,
-                                reader.filename
-                            )
-                            
-                            if excel_data:
-                                st.download_button(
-                                    "📥 Télécharger Excel",
-                                    excel_data,
-                                    f"FACS_{reader.filename}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    use_container_width=True
-                                )
-                
-                with col2:
-                    if st.session_state.marker_stats:
-                        csv_data = pd.DataFrame([
-                            {
-                                'Echantillon': reader.filename,
-                                'Marqueur': reader.get_marker_for_channel(channel) or channel,
-                                'Canal': channel,
-                                'Percentage': stats['percentage'],
-                                'Count': stats['count'],
-                                'MFI_Mean': stats['mean'],
-                                'MFI_Median': stats['median']
-                            }
-                            for channel, stats in st.session_state.marker_stats.items()
-                        ])
-                        
-                        st.download_button(
-                            "📋 Télécharger CSV Marqueurs",
-                            csv_data.to_csv(index=False),
-                            f"marqueurs_{reader.filename}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            "text/csv",
-                            use_container_width=True
-                        )
+            with col2:
+                if st.button("📥 Export Excel"):
+                    excel = export_flowjo_excel(reader, results)
+                    if excel:
+                        st.download_button("Télécharger", excel, f"{reader.filename}_stats.xlsx")
     
     except Exception as e:
-        st.error(f"❌ Erreur : {str(e)}")
+        st.error(f"Erreur: {e}")
         st.exception(e)
 
-# Footer
 st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: gray; padding: 1rem;'>
-    <p>🔬 <b>FACS Autogating - Identification des Marqueurs</b></p>
-    <p>CD4 • CD8 • CD3 • FoxP3 • et plus | Grille de visualisations | Export Excel détaillé</p>
-</div>
-""", unsafe_allow_html=True)
+st.markdown("<p style='text-align:center;color:gray;'>🔬 FACS FlowJo Style | Workflow Immunophénotypage</p>", unsafe_allow_html=True)
