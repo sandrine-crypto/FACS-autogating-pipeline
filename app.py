@@ -1,41 +1,40 @@
 #!/usr/bin/env python3
 """
-FACS Autogating - Gates Hexagonaux v6
-Nouvelles fonctionnalités:
-- Tous les gates (Cells, Singlets, Live, hCD45, CD3, CD4, CD8, CD19)
-- Export des graphiques (PNG, PDF, SVG)
-- Vue récapitulative de tous les gates
-- Hiérarchie complète du gating
+FACS Autogating - FlowJo Style v7
+- Visualisation style FlowJo (contour, densité, pseudo-color)
+- Populations: Cells, Singlets, Live, Leucocytes, T cells, B cells, NK, Daudi, mDC45
+- Marqueurs: hPDL1, hPD1, hCD16, Granzyme B+
+- Quadrant gates pour analyse multi-marqueurs
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import plotly.express as px
 from plotly.subplots import make_subplots
 from sklearn.mixture import GaussianMixture
 from sklearn.covariance import EllipticEnvelope
+from scipy import ndimage
 from pathlib import Path
 import tempfile
 import io
 import json
 import os
 import flowio
-import base64
 
-st.set_page_config(page_title="FACS - Complete Gating v6", page_icon="🔬", layout="wide")
+st.set_page_config(page_title="FACS FlowJo Style v7", page_icon="🔬", layout="wide")
 
 LEARNED_PARAMS_FILE = "learned_gating_params.json"
 
 st.markdown("""
 <style>
-.main-header { font-size: 1.8rem; color: #2c3e50; text-align: center; margin-bottom: 0.5rem; }
-.info-box { background: #e7f3ff; padding: 0.8rem; border-radius: 0.5rem; border-left: 4px solid #0066cc; margin: 0.5rem 0; }
-.confidence-high { color: #28a745; font-weight: bold; }
-.confidence-medium { color: #ffc107; font-weight: bold; }
-.confidence-low { color: #dc3545; font-weight: bold; }
-.gate-section { background: #f8f9fa; padding: 1rem; border-radius: 0.5rem; margin: 0.5rem 0; }
-.export-section { background: #fff3cd; padding: 1rem; border-radius: 0.5rem; margin: 1rem 0; }
+.main-header { font-size: 1.8rem; color: #1a5276; text-align: center; margin-bottom: 0.5rem; font-weight: bold; }
+.flowjo-plot { border: 2px solid #2c3e50; border-radius: 8px; padding: 5px; background: white; }
+.stat-box { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 1rem; border-radius: 8px; text-align: center; }
+.marker-positive { color: #27ae60; font-weight: bold; }
+.marker-negative { color: #e74c3c; }
+.quadrant-stats { font-family: monospace; font-size: 0.9rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -46,66 +45,22 @@ def load_learned_params():
     if os.path.exists(LEARNED_PARAMS_FILE):
         try:
             with open(LEARNED_PARAMS_FILE, 'r') as f:
-                params = json.load(f)
-                if 'version' not in params:
-                    params['version'] = 2
-                    for gate in params.get('gates', {}).values():
-                        gate.setdefault('scale_factor', 1.0)
-                        gate.setdefault('rotation', 0.0)
-                        gate.setdefault('confidence_history', [])
-                return params
+                return json.load(f)
         except:
             pass
-    return {'version': 2, 'n_corrections': 0, 'gates': {}}
+    return {'version': 3, 'n_corrections': 0, 'gates': {}}
 
 
 def save_learned_params(params):
-    if os.path.exists(LEARNED_PARAMS_FILE):
-        try:
-            os.rename(LEARNED_PARAMS_FILE, LEARNED_PARAMS_FILE + '.bak')
-        except:
-            pass
     with open(LEARNED_PARAMS_FILE, 'w') as f:
         json.dump(params, f, indent=2)
-
-
-def update_learned_params(gate_name, original_polygon, corrected_polygon, confidence=None):
-    params = load_learned_params()
-    if gate_name not in params['gates']:
-        params['gates'][gate_name] = {
-            'avg_adjustment': {'x': 0, 'y': 0},
-            'scale_factor': 1.0,
-            'n_samples': 0,
-            'confidence_history': []
-        }
-    gate_params = params['gates'][gate_name]
-    orig_arr = np.array(original_polygon)
-    corr_arr = np.array(corrected_polygon)
-    orig_center = np.mean(orig_arr, axis=0)
-    corr_center = np.mean(corr_arr, axis=0)
-    dx = float(corr_center[0] - orig_center[0])
-    dy = float(corr_center[1] - orig_center[1])
-    orig_dists = np.linalg.norm(orig_arr - orig_center, axis=1)
-    corr_dists = np.linalg.norm(corr_arr - corr_center, axis=1)
-    scale = float(np.mean(corr_dists) / (np.mean(orig_dists) + 1e-10))
-    gate_params['n_samples'] += 1
-    n = gate_params['n_samples']
-    alpha = 2 / (n + 1)
-    gate_params['avg_adjustment']['x'] = (1 - alpha) * gate_params['avg_adjustment']['x'] + alpha * dx
-    gate_params['avg_adjustment']['y'] = (1 - alpha) * gate_params['avg_adjustment']['y'] + alpha * dy
-    gate_params['scale_factor'] = (1 - alpha) * gate_params['scale_factor'] + alpha * scale
-    if confidence is not None:
-        gate_params['confidence_history'].append(float(confidence))
-        gate_params['confidence_history'] = gate_params['confidence_history'][-20:]
-    params['n_corrections'] += 1
-    save_learned_params(params)
 
 
 def apply_learned_adj(polygon, gate_name):
     if polygon is None:
         return None
     params = load_learned_params()
-    if gate_name not in params['gates']:
+    if gate_name not in params.get('gates', {}):
         return polygon
     gate = params['gates'][gate_name]
     adj = gate.get('avg_adjustment', {'x': 0, 'y': 0})
@@ -132,20 +87,24 @@ class FCSReader:
         labels = []
         for i in range(1, n_ch + 1):
             pnn = self.flow_data.text.get(f'$P{i}N', '') or self.flow_data.text.get(f'p{i}n', f'Ch{i}')
-            labels.append(str(pnn).strip() if pnn else f'Ch{i}')
+            pns = self.flow_data.text.get(f'$P{i}S', '') or self.flow_data.text.get(f'p{i}s', '')
+            label = str(pns).strip() if pns else str(pnn).strip() if pnn else f'Ch{i}'
+            labels.append(label)
         self.channels = labels
         self.data = pd.DataFrame(events, columns=labels)
 
 
 def find_channel(columns, keywords):
+    """Recherche flexible de canal"""
     for col in columns:
         for kw in keywords:
             if col.upper() == kw.upper():
                 return col
     for col in columns:
-        col_upper = col.upper()
+        col_upper = col.upper().replace('-', '').replace('_', '').replace(' ', '')
         for kw in keywords:
-            if kw.upper() in col_upper:
+            kw_clean = kw.upper().replace('-', '').replace('_', '').replace(' ', '')
+            if kw_clean in col_upper:
                 return col
     return None
 
@@ -156,11 +115,25 @@ def biex(x, width=150, scale=50):
     return np.arcsinh(np.asarray(x, float) / width) * scale
 
 
+def logicle_approx(x, T=262144, M=4.5, W=0.5):
+    """Approximation de la transformation Logicle (style FlowJo)"""
+    x = np.asarray(x, float)
+    w = W / (M + W)
+    return np.where(x >= 0,
+                    np.log10(1 + x / (T * w)) / (M + W) * M,
+                    -np.log10(1 - x / (T * w)) / (M + W) * M)
+
+
 # ==================== GEOMETRIE ====================
 
 def create_hexagon(center_x, center_y, radius_x, radius_y):
     angles = np.linspace(0, 2 * np.pi, 7)[:-1]
     return [(float(center_x + radius_x * np.cos(a)), float(center_y + radius_y * np.sin(a))) for a in angles]
+
+
+def create_rectangle(x_min, x_max, y_min, y_max):
+    """Crée un gate rectangulaire"""
+    return [(x_min, y_min), (x_max, y_min), (x_max, y_max), (x_min, y_max)]
 
 
 def point_in_polygon(x, y, polygon):
@@ -184,10 +157,9 @@ def point_in_polygon(x, y, polygon):
 def apply_gate(data, x_ch, y_ch, polygon, parent_mask=None):
     if x_ch is None or y_ch is None or polygon is None or len(polygon) < 3:
         return pd.Series(False, index=data.index)
-    x = data[x_ch].values
-    y = data[y_ch].values
+    x, y = data[x_ch].values, data[y_ch].values
     base = parent_mask.values.copy() if parent_mask is not None else np.ones(len(data), dtype=bool)
-    valid = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0) & base
+    valid = np.isfinite(x) & np.isfinite(y) & base
     if not valid.any():
         return pd.Series(False, index=data.index)
     xt, yt = biex(x), biex(y)
@@ -195,70 +167,57 @@ def apply_gate(data, x_ch, y_ch, polygon, parent_mask=None):
     return pd.Series(valid & in_poly, index=data.index)
 
 
-def move_polygon(polygon, dx, dy):
-    if polygon is None:
+def apply_threshold_gate(data, channel, threshold, parent_mask=None, above=True):
+    """Gate basé sur un seuil (pour marqueurs)"""
+    if channel is None:
+        return pd.Series(False, index=data.index)
+    x = biex(data[channel].values)
+    base = parent_mask.values if parent_mask is not None else np.ones(len(data), dtype=bool)
+    valid = np.isfinite(x) & base
+    if above:
+        return pd.Series(valid & (x > threshold), index=data.index)
+    else:
+        return pd.Series(valid & (x <= threshold), index=data.index)
+
+
+# ==================== QUADRANT GATES ====================
+
+def calculate_quadrant_stats(data, x_ch, y_ch, x_threshold, y_threshold, parent_mask=None):
+    """Calcule les statistiques des 4 quadrants (style FlowJo)"""
+    if x_ch is None or y_ch is None:
         return None
-    return [(p[0] + dx, p[1] + dy) for p in polygon]
 
+    x = biex(data[x_ch].values)
+    y = biex(data[y_ch].values)
 
-def scale_polygon(polygon, factor):
-    if polygon is None:
+    if parent_mask is not None:
+        mask = parent_mask.values & np.isfinite(x) & np.isfinite(y)
+    else:
+        mask = np.isfinite(x) & np.isfinite(y)
+
+    n_total = mask.sum()
+    if n_total == 0:
         return None
-    center = np.mean(polygon, axis=0)
-    return [(float(center[0] + factor * (p[0] - center[0])),
-             float(center[1] + factor * (p[1] - center[1]))) for p in polygon]
 
+    x_m, y_m = x[mask], y[mask]
 
-def rotate_polygon(polygon, angle_deg):
-    if polygon is None:
-        return None
-    angle_rad = np.radians(angle_deg)
-    center = np.mean(polygon, axis=0)
-    cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
-    return [(float(center[0] + (p[0] - center[0]) * cos_a - (p[1] - center[1]) * sin_a),
-             float(center[1] + (p[0] - center[0]) * sin_a + (p[1] - center[1]) * cos_a)) for p in polygon]
+    q1 = (x_m <= x_threshold) & (y_m > y_threshold)   # Upper Left
+    q2 = (x_m > x_threshold) & (y_m > y_threshold)    # Upper Right
+    q3 = (x_m <= x_threshold) & (y_m <= y_threshold)  # Lower Left
+    q4 = (x_m > x_threshold) & (y_m <= y_threshold)   # Lower Right
+
+    return {
+        'UL': {'count': q1.sum(), 'pct': q1.sum() / n_total * 100},
+        'UR': {'count': q2.sum(), 'pct': q2.sum() / n_total * 100},
+        'LL': {'count': q3.sum(), 'pct': q3.sum() / n_total * 100},
+        'LR': {'count': q4.sum(), 'pct': q4.sum() / n_total * 100},
+        'total': n_total
+    }
 
 
 # ==================== AUTO-GATING ====================
 
-def compute_gate_confidence(data, polygon, x_ch, y_ch, parent_mask=None):
-    if polygon is None or x_ch is None or y_ch is None:
-        return 0.0
-    x, y = data[x_ch].values, data[y_ch].values
-    mask = (parent_mask.values if parent_mask is not None else np.ones(len(data), dtype=bool)) & \
-           np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
-    if mask.sum() < 100:
-        return 0.0
-    xt, yt = biex(x[mask]), biex(y[mask])
-    gate_mask = apply_gate(data, x_ch, y_ch, polygon, parent_mask)
-    in_gate = gate_mask.values[mask]
-    if in_gate.sum() < 10 or (~in_gate).sum() < 10:
-        return 50.0
-    mean_in = np.array([np.mean(xt[in_gate]), np.mean(yt[in_gate])])
-    mean_out = np.array([np.mean(xt[~in_gate]), np.mean(yt[~in_gate])])
-    std_in = np.array([np.std(xt[in_gate]), np.std(yt[in_gate])])
-    separation = np.linalg.norm(mean_in - mean_out) / (np.mean(std_in) + 1e-10)
-    sep_score = min(100, separation * 25)
-    var_in = np.var(xt[in_gate]) + np.var(yt[in_gate])
-    var_total = np.var(xt) + np.var(yt)
-    compact_score = max(0, min(100, (1 - var_in / (var_total + 1e-10)) * 100))
-    prop = in_gate.sum() / len(in_gate)
-    prop_score = 100 if 0.1 <= prop <= 0.9 else (prop * 1000 if prop < 0.1 else (1 - prop) * 1000)
-    return float(np.clip(0.4 * sep_score + 0.4 * compact_score + 0.2 * prop_score, 0, 100))
-
-
-def remove_outliers(X, contamination=0.03):
-    if len(X) < 100:
-        return X, np.ones(len(X), dtype=bool)
-    try:
-        detector = EllipticEnvelope(contamination=contamination, random_state=42)
-        mask = detector.fit_predict(X) == 1
-        return X[mask], mask
-    except:
-        return X, np.ones(len(X), dtype=bool)
-
-
-def auto_gate_hexagon_robust(data, x_ch, y_ch, parent_mask=None, mode='main'):
+def auto_gate_hexagon(data, x_ch, y_ch, parent_mask=None, mode='main'):
     if x_ch is None or y_ch is None:
         return None, 0.0
     x, y = data[x_ch].values, data[y_ch].values
@@ -266,47 +225,41 @@ def auto_gate_hexagon_robust(data, x_ch, y_ch, parent_mask=None, mode='main'):
            np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
     if mask.sum() < 100:
         return None, 0.0
+
     xt, yt = biex(x[mask]), biex(y[mask])
     X = np.column_stack([xt, yt])
+
     try:
+        # Remove outliers
         if len(X) > 500:
-            X_clean, _ = remove_outliers(X)
-            if len(X_clean) < 100:
-                X_clean = X
+            detector = EllipticEnvelope(contamination=0.03, random_state=42)
+            inlier_mask = detector.fit_predict(X) == 1
+            X_clean = X[inlier_mask] if inlier_mask.sum() > 100 else X
         else:
             X_clean = X
 
-        # BIC pour sélection du nombre de composantes
-        best_bic, best_n = np.inf, 2
-        for n in range(2, 4):
-            try:
-                gmm = GaussianMixture(n_components=n, covariance_type='full', random_state=42, n_init=3)
-                gmm.fit(X_clean)
-                bic = gmm.bic(X_clean)
-                if bic < best_bic:
-                    best_bic, best_n = bic, n
-            except:
-                pass
-
-        # Fit GMM
+        # GMM
         best_gmm, best_score = None, -np.inf
-        for init in range(5):
-            try:
-                gmm = GaussianMixture(n_components=best_n, covariance_type='full',
-                                      random_state=42 + init, n_init=1, max_iter=200)
-                gmm.fit(X_clean)
-                score = gmm.score(X_clean)
-                if score > best_score:
-                    best_score, best_gmm = score, gmm
-            except:
-                pass
+        for n in [2, 3]:
+            for init in range(3):
+                try:
+                    gmm = GaussianMixture(n_components=n, covariance_type='full',
+                                          random_state=42+init, n_init=1, max_iter=200)
+                    gmm.fit(X_clean)
+                    score = gmm.bic(X_clean)
+                    if best_gmm is None or score < best_score:
+                        best_score, best_gmm = score, gmm
+                except:
+                    pass
 
         if best_gmm is None:
             return None, 0.0
 
         labels = best_gmm.predict(X_clean)
+        n_comp = best_gmm.n_components
+
         cluster_stats = []
-        for i in range(best_n):
+        for i in range(n_comp):
             cm = labels == i
             if cm.sum() > 0:
                 cluster_stats.append({
@@ -324,6 +277,8 @@ def auto_gate_hexagon_robust(data, x_ch, y_ch, parent_mask=None, mode='main'):
             target = min(cluster_stats, key=lambda x: x['mean_x'])['idx']
         elif mode == 'high_x':
             target = max(cluster_stats, key=lambda x: x['mean_x'])['idx']
+        elif mode == 'high_y':
+            target = max(cluster_stats, key=lambda x: x['mean_y'])['idx']
         else:
             target = 0
 
@@ -335,46 +290,69 @@ def auto_gate_hexagon_robust(data, x_ch, y_ch, parent_mask=None, mode='main'):
         center_x, center_y = np.median(cx), np.median(cy)
         radius_x = max(np.percentile(np.abs(cx - center_x), 90) * 1.2, 8)
         radius_y = max(np.percentile(np.abs(cy - center_y), 90) * 1.2, 8)
+
         polygon = create_hexagon(center_x, center_y, radius_x, radius_y)
-        confidence = compute_gate_confidence(data, polygon, x_ch, y_ch, parent_mask)
-        return polygon, confidence
-    except Exception as e:
+        return polygon, 75.0
+    except:
         return None, 0.0
 
 
-# ==================== VISUALISATION ====================
+def auto_find_threshold(data, channel, parent_mask=None, method='bimodal'):
+    """Trouve automatiquement un seuil pour un marqueur"""
+    if channel is None:
+        return 0.0
 
-def get_confidence_class(confidence):
-    if confidence >= 70:
-        return "confidence-high", "🟢"
-    elif confidence >= 40:
-        return "confidence-medium", "🟡"
+    x = data[channel].values
+    if parent_mask is not None:
+        x = x[parent_mask.values & np.isfinite(x) & (x > 0)]
     else:
-        return "confidence-low", "🔴"
+        x = x[np.isfinite(x) & (x > 0)]
+
+    if len(x) < 100:
+        return 0.0
+
+    xt = biex(x)
+
+    try:
+        gmm = GaussianMixture(n_components=2, random_state=42)
+        gmm.fit(xt.reshape(-1, 1))
+        means = gmm.means_.flatten()
+        threshold = np.mean(means)
+        return float(threshold)
+    except:
+        return float(np.percentile(xt, 50))
 
 
-def create_plot(data, x_ch, y_ch, x_label, y_label, title, polygon, parent_mask,
-                gate_name, confidence=None, compact=False):
-    """Crée le graphique Plotly"""
+# ==================== VISUALISATION FLOWJO ====================
+
+def create_flowjo_plot(data, x_ch, y_ch, x_label, y_label, title, polygon=None,
+                       parent_mask=None, gate_name="", plot_type='pseudo',
+                       quadrant_lines=None, show_stats=True):
+    """
+    Crée un plot style FlowJo
+    plot_type: 'pseudo' (pseudo-color), 'contour', 'dot', 'density'
+    """
     if x_ch is None or y_ch is None:
         fig = go.Figure()
         fig.add_annotation(text="Canal non trouvé", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
-        fig.update_layout(height=300 if compact else 400)
-        return fig, 0, 0.0
+        fig.update_layout(height=350)
+        return fig, 0, 0.0, None
 
     x, y = data[x_ch].values, data[y_ch].values
     mask = (parent_mask.values if parent_mask is not None else np.ones(len(data), dtype=bool)) & \
-           np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
-    n_parent = mask.sum()
+           np.isfinite(x) & np.isfinite(y)
 
+    n_parent = mask.sum()
     if n_parent == 0:
         fig = go.Figure()
         fig.add_annotation(text="Pas de données", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
-        fig.update_layout(height=300 if compact else 400)
-        return fig, 0, 0.0
+        fig.update_layout(height=350)
+        return fig, 0, 0.0, None
 
     xt, yt = biex(x[mask]), biex(y[mask])
-    n_display = min(8000 if compact else 12000, len(xt))
+
+    # Sous-échantillonnage
+    n_display = min(15000, len(xt))
     if len(xt) > n_display:
         idx = np.random.choice(len(xt), n_display, replace=False)
         xd, yd = xt[idx], yt[idx]
@@ -383,26 +361,63 @@ def create_plot(data, x_ch, y_ch, x_label, y_label, title, polygon, parent_mask,
 
     fig = go.Figure()
 
-    # Points
-    try:
-        from scipy.stats import gaussian_kde
-        if len(xd) > 500:
-            xy = np.vstack([xd, yd])
-            kde_idx = np.random.choice(len(xd), min(2000, len(xd)), replace=False)
-            kde = gaussian_kde(xy[:, kde_idx])
-            colors = kde(xy)
-        else:
-            colors = yd
-    except:
-        colors = yd
+    if plot_type == 'pseudo':
+        # Pseudo-color density (FlowJo style)
+        fig.add_trace(go.Histogram2d(
+            x=xd, y=yd,
+            colorscale='Hot',
+            reversescale=True,
+            nbinsx=150, nbinsy=150,
+            showscale=False,
+            zsmooth='best'
+        ))
+        # Overlay scatter for low-density regions
+        fig.add_trace(go.Scattergl(
+            x=xd, y=yd, mode='markers',
+            marker=dict(size=1, color='blue', opacity=0.1),
+            hoverinfo='skip'
+        ))
 
-    fig.add_trace(go.Scattergl(
-        x=xd, y=yd, mode='markers',
-        marker=dict(size=2 if compact else 3, color=colors, colorscale='Viridis', opacity=0.5),
-        hoverinfo='skip', name='Events'
-    ))
+    elif plot_type == 'contour':
+        # Contour plot (FlowJo style)
+        fig.add_trace(go.Histogram2dContour(
+            x=xd, y=yd,
+            colorscale='Blues',
+            reversescale=False,
+            showscale=False,
+            contours=dict(coloring='heatmap', showlines=True),
+            ncontours=15
+        ))
+
+    elif plot_type == 'density':
+        # Density avec KDE
+        try:
+            from scipy.stats import gaussian_kde
+            xy = np.vstack([xd, yd])
+            kde = gaussian_kde(xy)
+            colors = kde(xy)
+            fig.add_trace(go.Scattergl(
+                x=xd, y=yd, mode='markers',
+                marker=dict(size=2, color=colors, colorscale='Viridis', opacity=0.6),
+                hoverinfo='skip'
+            ))
+        except:
+            fig.add_trace(go.Scattergl(
+                x=xd, y=yd, mode='markers',
+                marker=dict(size=2, color='blue', opacity=0.3),
+                hoverinfo='skip'
+            ))
+
+    else:  # dot
+        fig.add_trace(go.Scattergl(
+            x=xd, y=yd, mode='markers',
+            marker=dict(size=2, color='#1f77b4', opacity=0.4),
+            hoverinfo='skip'
+        ))
 
     n_in, pct = 0, 0.0
+
+    # Polygon gate
     if polygon and len(polygon) >= 3:
         gate_mask = apply_gate(data, x_ch, y_ch, polygon, parent_mask)
         n_in = int(gate_mask.sum())
@@ -411,192 +426,114 @@ def create_plot(data, x_ch, y_ch, x_label, y_label, title, polygon, parent_mask,
         px = [p[0] for p in polygon] + [polygon[0][0]]
         py = [p[1] for p in polygon] + [polygon[0][1]]
 
-        if confidence is not None and confidence >= 70:
-            fill_color, line_color = 'rgba(40, 167, 69, 0.15)', '#28a745'
-        elif confidence is not None and confidence >= 40:
-            fill_color, line_color = 'rgba(255, 193, 7, 0.15)', '#ffc107'
-        else:
-            fill_color, line_color = 'rgba(220, 53, 69, 0.15)', '#dc3545'
+        fig.add_trace(go.Scatter(
+            x=px, y=py, fill='toself',
+            fillcolor='rgba(0, 255, 0, 0.1)',
+            line=dict(color='#00ff00', width=2),
+            mode='lines', name='Gate'
+        ))
 
-        fig.add_trace(go.Scatter(x=px, y=py, fill='toself', fillcolor=fill_color,
-                                  line=dict(color=line_color, width=2), mode='lines', name='Gate'))
-
-        if not compact:
-            fig.add_trace(go.Scatter(
-                x=[p[0] for p in polygon], y=[p[1] for p in polygon],
-                mode='markers+text',
-                marker=dict(size=12, color='white', line=dict(color=line_color, width=2)),
-                text=[str(i+1) for i in range(len(polygon))],
-                textposition='middle center',
-                textfont=dict(size=9, color=line_color),
-                name='Vertices'
-            ))
-
+        # Gate annotation
         cx_p, cy_p = np.mean([p[0] for p in polygon]), np.mean([p[1] for p in polygon])
-        conf_text = f"<br>{confidence:.0f}%" if confidence is not None else ""
         fig.add_annotation(
             x=cx_p, y=cy_p,
-            text=f"<b>{gate_name}</b><br>{pct:.1f}%{conf_text}",
-            showarrow=False, font=dict(size=9 if compact else 11),
-            bgcolor='rgba(255,255,255,0.9)', bordercolor=line_color, borderwidth=1
+            text=f"<b>{gate_name}</b><br>{pct:.1f}%",
+            showarrow=False, font=dict(size=11, color='white'),
+            bgcolor='rgba(0,0,0,0.7)', borderpad=4
         )
 
+    # Quadrant lines
+    quadrant_stats = None
+    if quadrant_lines:
+        x_thresh, y_thresh = quadrant_lines
+
+        # Vertical line
+        fig.add_vline(x=x_thresh, line=dict(color='black', width=1.5, dash='dash'))
+        # Horizontal line
+        fig.add_hline(y=y_thresh, line=dict(color='black', width=1.5, dash='dash'))
+
+        # Calculate quadrant stats
+        quadrant_stats = calculate_quadrant_stats(data, x_ch, y_ch, x_thresh, y_thresh, parent_mask)
+
+        if quadrant_stats and show_stats:
+            # Add quadrant labels
+            x_range = [min(xd), max(xd)]
+            y_range = [min(yd), max(yd)]
+
+            positions = {
+                'UL': (x_range[0] + (x_thresh - x_range[0]) * 0.5, y_thresh + (y_range[1] - y_thresh) * 0.8),
+                'UR': (x_thresh + (x_range[1] - x_thresh) * 0.5, y_thresh + (y_range[1] - y_thresh) * 0.8),
+                'LL': (x_range[0] + (x_thresh - x_range[0]) * 0.5, y_range[0] + (y_thresh - y_range[0]) * 0.2),
+                'LR': (x_thresh + (x_range[1] - x_thresh) * 0.5, y_range[0] + (y_thresh - y_range[0]) * 0.2),
+            }
+
+            for quad, pos in positions.items():
+                fig.add_annotation(
+                    x=pos[0], y=pos[1],
+                    text=f"<b>{quadrant_stats[quad]['pct']:.1f}%</b>",
+                    showarrow=False,
+                    font=dict(size=12, color='black'),
+                    bgcolor='rgba(255,255,255,0.8)'
+                )
+
     fig.update_layout(
-        title=dict(text=f"<b>{title}</b> (n={n_parent:,})", x=0.5, font=dict(size=11 if compact else 14)),
+        title=dict(text=f"<b>{title}</b> (n={n_parent:,})", x=0.5, font=dict(size=12)),
         xaxis_title=x_label, yaxis_title=y_label,
-        showlegend=False, height=280 if compact else 400,
-        margin=dict(l=50, r=20, t=40, b=40),
-        plot_bgcolor='#fafafa',
-        xaxis=dict(showgrid=True, gridcolor='#e0e0e0'),
-        yaxis=dict(showgrid=True, gridcolor='#e0e0e0')
-    )
-    return fig, n_in, pct
-
-
-def create_summary_figure(figures_data, filename):
-    """Crée une figure récapitulative avec tous les gates"""
-    n_gates = len(figures_data)
-    n_cols = 3
-    n_rows = (n_gates + n_cols - 1) // n_cols
-
-    fig = make_subplots(
-        rows=n_rows, cols=n_cols,
-        subplot_titles=[d['title'] for d in figures_data],
-        horizontal_spacing=0.08, vertical_spacing=0.12
+        showlegend=False, height=350,
+        margin=dict(l=50, r=20, t=45, b=45),
+        plot_bgcolor='white',
+        xaxis=dict(showgrid=True, gridcolor='#eee', zeroline=False, showline=True, linecolor='black'),
+        yaxis=dict(showgrid=True, gridcolor='#eee', zeroline=False, showline=True, linecolor='black'),
     )
 
-    for idx, gate_data in enumerate(figures_data):
-        row = idx // n_cols + 1
-        col = idx % n_cols + 1
-
-        if gate_data['xd'] is not None and len(gate_data['xd']) > 0:
-            fig.add_trace(go.Scattergl(
-                x=gate_data['xd'], y=gate_data['yd'],
-                mode='markers',
-                marker=dict(size=2, color=gate_data['yd'], colorscale='Viridis', opacity=0.4),
-                showlegend=False
-            ), row=row, col=col)
-
-            if gate_data['polygon']:
-                px = [p[0] for p in gate_data['polygon']] + [gate_data['polygon'][0][0]]
-                py = [p[1] for p in gate_data['polygon']] + [gate_data['polygon'][0][1]]
-
-                conf = gate_data.get('confidence', 50)
-                if conf >= 70:
-                    line_color = '#28a745'
-                elif conf >= 40:
-                    line_color = '#ffc107'
-                else:
-                    line_color = '#dc3545'
-
-                fig.add_trace(go.Scatter(
-                    x=px, y=py, fill='toself',
-                    fillcolor=f'rgba({int(line_color[1:3], 16)}, {int(line_color[3:5], 16)}, {int(line_color[5:7], 16)}, 0.2)',
-                    line=dict(color=line_color, width=2), mode='lines', showlegend=False
-                ), row=row, col=col)
-
-        fig.update_xaxes(title_text=gate_data['x_label'], row=row, col=col, title_font=dict(size=10))
-        fig.update_yaxes(title_text=gate_data['y_label'], row=row, col=col, title_font=dict(size=10))
-
-    fig.update_layout(
-        title=dict(text=f"<b>Gating Summary - {filename}</b>", x=0.5, font=dict(size=16)),
-        height=300 * n_rows,
-        showlegend=False,
-        plot_bgcolor='white'
-    )
-    return fig
+    return fig, n_in, pct, quadrant_stats
 
 
-def fig_to_bytes(fig, format='png', width=1200, height=800):
-    """Convertit une figure Plotly en bytes pour téléchargement"""
-    try:
-        import kaleido
-        return fig.to_image(format=format, width=width, height=height, scale=2)
-    except ImportError:
+# ==================== CALCUL MARQUEURS ====================
+
+def calculate_marker_stats(data, channel, parent_mask=None, threshold=None):
+    """Calcule les statistiques d'un marqueur (MFI, % positif, etc.)"""
+    if channel is None:
         return None
 
+    x = data[channel].values
+    if parent_mask is not None:
+        mask = parent_mask.values & np.isfinite(x)
+    else:
+        mask = np.isfinite(x)
 
-# ==================== POINT EDITOR ====================
+    if mask.sum() < 10:
+        return None
 
-def render_point_editor(gkey, poly, gate_name):
-    st.markdown(f"**Éditer {gate_name}**")
-    modified = False
-    new_poly = list(poly)
+    x_valid = x[mask]
+    xt = biex(x_valid)
 
-    # Afficher en 2 colonnes pour 6 points
-    for row in range(3):
-        cols = st.columns(4)
-        for col_idx in range(2):
-            i = row * 2 + col_idx
-            if i < len(poly):
-                with cols[col_idx * 2]:
-                    new_x = st.number_input(f"P{i+1} X", value=float(poly[i][0]), step=2.0,
-                                           key=f"x_{gkey}_{i}", label_visibility="collapsed")
-                with cols[col_idx * 2 + 1]:
-                    new_y = st.number_input(f"P{i+1} Y", value=float(poly[i][1]), step=2.0,
-                                           key=f"y_{gkey}_{i}", label_visibility="collapsed")
-                if new_x != poly[i][0] or new_y != poly[i][1]:
-                    new_poly[i] = (new_x, new_y)
-                    modified = True
+    if threshold is None:
+        threshold = auto_find_threshold(data, channel, parent_mask)
 
-    # Boutons rapides
-    c1, c2, c3, c4 = st.columns(4)
-    step = 10
-    if c1.button("⬆️", key=f"up_{gkey}"):
-        return move_polygon(poly, 0, step)
-    if c2.button("⬇️", key=f"dn_{gkey}"):
-        return move_polygon(poly, 0, -step)
-    if c3.button("⬅️", key=f"lt_{gkey}"):
-        return move_polygon(poly, -step, 0)
-    if c4.button("➡️", key=f"rt_{gkey}"):
-        return move_polygon(poly, step, 0)
+    positive = xt > threshold
 
-    c5, c6, c7, c8 = st.columns(4)
-    if c5.button("➕", key=f"grow_{gkey}"):
-        return scale_polygon(poly, 1.1)
-    if c6.button("➖", key=f"shrink_{gkey}"):
-        return scale_polygon(poly, 0.9)
-    if c7.button("↻", key=f"rotcw_{gkey}"):
-        return rotate_polygon(poly, 15)
-    if c8.button("↺", key=f"rotccw_{gkey}"):
-        return rotate_polygon(poly, -15)
-
-    return new_poly if modified else None
+    return {
+        'channel': channel,
+        'n_total': len(x_valid),
+        'n_positive': positive.sum(),
+        'pct_positive': positive.sum() / len(x_valid) * 100,
+        'mfi_all': float(np.median(x_valid)),
+        'mfi_positive': float(np.median(x_valid[positive])) if positive.sum() > 0 else 0,
+        'mfi_negative': float(np.median(x_valid[~positive])) if (~positive).sum() > 0 else 0,
+        'threshold': threshold,
+        'cv': float(np.std(x_valid) / np.mean(x_valid) * 100) if np.mean(x_valid) > 0 else 0
+    }
 
 
 # ==================== MAIN APPLICATION ====================
 
-st.markdown('<h1 class="main-header">🔬 FACS - Complete Gating v6</h1>', unsafe_allow_html=True)
-
-learned = load_learned_params()
-n_learned = learned.get('n_corrections', 0)
-if n_learned > 0:
-    st.success(f"🧠 {n_learned} correction(s) apprises")
-
-# Gestion apprentissage
-with st.expander("🧠 Gérer l'apprentissage", expanded=False):
-    if n_learned == 0:
-        st.info("Aucune correction enregistrée")
-    else:
-        params = load_learned_params()
-        for gn, gd in params.get('gates', {}).items():
-            col1, col2 = st.columns([4, 1])
-            col1.write(f"**{gn}**: {gd.get('n_samples', 0)} corrections")
-            if col2.button("🗑️", key=f"del_{gn}"):
-                del params['gates'][gn]
-                params['n_corrections'] = max(0, params['n_corrections'] - gd.get('n_samples', 0))
-                save_learned_params(params)
-                st.rerun()
-        if st.button("🗑️ Tout réinitialiser"):
-            save_learned_params({'version': 2, 'n_corrections': 0, 'gates': {}})
-            st.rerun()
+st.markdown('<h1 class="main-header">🔬 FACS Analysis - FlowJo Style v7</h1>', unsafe_allow_html=True)
 
 # Session state
-for key in ['reader', 'data', 'channels', 'polygons', 'original_polygons',
-            'auto_done', 'confidences', 'undo_stack', 'figures_data']:
+for key in ['reader', 'data', 'channels', 'polygons', 'masks', 'auto_done', 'thresholds']:
     if key not in st.session_state:
-        st.session_state[key] = {} if key in ['channels', 'polygons', 'original_polygons', 'confidences'] else \
-                                 ([] if key in ['undo_stack', 'figures_data'] else (False if key == 'auto_done' else None))
+        st.session_state[key] = {} if key in ['channels', 'polygons', 'masks', 'thresholds'] else (False if key == 'auto_done' else None)
 
 # Upload
 uploaded = st.file_uploader("📁 Fichier FCS", type=['fcs'])
@@ -613,22 +550,36 @@ if uploaded:
             st.session_state.data = reader.data
             st.session_state.fname = uploaded.name
             st.session_state.polygons = {}
-            st.session_state.original_polygons = {}
-            st.session_state.confidences = {}
+            st.session_state.masks = {}
+            st.session_state.thresholds = {}
             st.session_state.auto_done = False
-            st.session_state.figures_data = []
 
             cols = list(reader.data.columns)
             st.session_state.channels = {
-                'FSC-A': find_channel(cols, ['FSC-A']),
-                'FSC-H': find_channel(cols, ['FSC-H']),
-                'SSC-A': find_channel(cols, ['SSC-A']),
-                'LiveDead': find_channel(cols, ['LiveDead', 'Viab', 'Aqua', 'Live', 'L/D', 'LD']),
-                'hCD45': find_channel(cols, ['PerCP', 'CD45', 'hCD45']),
-                'CD3': find_channel(cols, ['AF488', 'FITC', 'CD3']),
-                'CD19': find_channel(cols, ['PE-Fire', 'CD19', 'PE-CF594']),
-                'CD4': find_channel(cols, ['BV650', 'CD4', 'APC-Cy7']),
-                'CD8': find_channel(cols, ['BUV805', 'CD8', 'APC']),
+                # Scatter
+                'FSC-A': find_channel(cols, ['FSC-A', 'FSC_A']),
+                'FSC-H': find_channel(cols, ['FSC-H', 'FSC_H']),
+                'SSC-A': find_channel(cols, ['SSC-A', 'SSC_A']),
+                # Viabilité
+                'LiveDead': find_channel(cols, ['LiveDead', 'Viab', 'Aqua', 'Live', 'L/D', 'LD', 'Zombie']),
+                # Leucocytes
+                'hCD45': find_channel(cols, ['hCD45', 'CD45', 'PerCP']),
+                'mCD45': find_channel(cols, ['mCD45', 'mCD45.1']),
+                # Lymphocytes T
+                'CD3': find_channel(cols, ['CD3', 'AF488', 'FITC']),
+                'CD4': find_channel(cols, ['CD4', 'BV650']),
+                'CD8': find_channel(cols, ['CD8', 'BUV805', 'APC']),
+                # Lymphocytes B
+                'CD19': find_channel(cols, ['CD19', 'PE-Fire', 'PE-CF594']),
+                # NK
+                'CD56': find_channel(cols, ['CD56', 'BV421', 'Pacific Blue']),
+                'CD16': find_channel(cols, ['CD16', 'hCD16', 'BV785']),
+                # Cellules cibles
+                'Daudi': find_channel(cols, ['Daudi', 'CellTrace', 'CFSE', 'Violet']),
+                # Marqueurs fonctionnels
+                'hPDL1': find_channel(cols, ['hPDL1', 'PDL1', 'PD-L1', 'CD274']),
+                'hPD1': find_channel(cols, ['hPD1', 'PD1', 'PD-1', 'CD279']),
+                'GranzymeB': find_channel(cols, ['GranzymeB', 'Granzyme', 'GrzB', 'GrB', 'GZMB']),
             }
 
     reader = st.session_state.reader
@@ -637,14 +588,25 @@ if uploaded:
     n_total = len(data)
 
     # Métriques
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Événements", f"{n_total:,}")
     c2.metric("Canaux", len(reader.channels))
-    c3.metric("Fichier", reader.filename[:30])
+    c3.metric("Fichier", reader.filename[:20])
 
-    with st.expander("📋 Canaux détectés"):
+    # Options de visualisation
+    with st.sidebar:
+        st.markdown("### ⚙️ Options")
+        plot_type = st.selectbox("Style de plot", ['pseudo', 'contour', 'density', 'dot'],
+                                  format_func=lambda x: {'pseudo': '🎨 Pseudo-color', 'contour': '📊 Contour',
+                                                         'density': '🌡️ Densité', 'dot': '⚫ Dot plot'}[x])
+        show_quadrants = st.checkbox("Afficher quadrants", value=True)
+
+        st.markdown("### 📋 Canaux détectés")
         for name, canal in ch.items():
-            st.write(f"{'✅' if canal else '❌'} **{name}**: {canal or 'Non trouvé'}")
+            if canal:
+                st.write(f"✅ {name}: {canal[:15]}")
+            else:
+                st.write(f"❌ {name}")
 
     if ch['FSC-A'] is None or ch['SSC-A'] is None:
         st.error("❌ FSC-A ou SSC-A non trouvé!")
@@ -654,390 +616,401 @@ if uploaded:
 
     # AUTO-GATING
     if not st.session_state.auto_done:
-        if st.button("🚀 LANCER L'AUTO-GATING COMPLET", type="primary", use_container_width=True):
+        if st.button("🚀 LANCER L'ANALYSE COMPLÈTE", type="primary", use_container_width=True):
             progress = st.progress(0, "Initialisation...")
             polygons = st.session_state.polygons
-            confidences = st.session_state.confidences
-            original = st.session_state.original_polygons
+            masks = st.session_state.masks
+            thresholds = st.session_state.thresholds
 
             # 1. Cells
-            progress.progress(5, "Gate Cells...")
-            poly, conf = auto_gate_hexagon_robust(data, ch['FSC-A'], ch['SSC-A'], None, 'main')
-            poly = apply_learned_adj(poly, 'cells')
-            polygons['cells'], confidences['cells'] = poly, conf
-            original['cells'] = list(poly) if poly else None
+            progress.progress(5, "Cells...")
+            poly, _ = auto_gate_hexagon(data, ch['FSC-A'], ch['SSC-A'], None, 'main')
+            polygons['cells'] = apply_learned_adj(poly, 'cells')
+            masks['cells'] = apply_gate(data, ch['FSC-A'], ch['SSC-A'], polygons['cells'], None)
 
             # 2. Singlets
-            progress.progress(15, "Gate Singlets...")
-            if ch['FSC-H'] and poly:
-                cells_m = apply_gate(data, ch['FSC-A'], ch['SSC-A'], poly, None)
-                poly2, conf2 = auto_gate_hexagon_robust(data, ch['FSC-A'], ch['FSC-H'], cells_m, 'main')
-                poly2 = apply_learned_adj(poly2, 'singlets')
+            progress.progress(10, "Singlets...")
+            if ch['FSC-H']:
+                poly, _ = auto_gate_hexagon(data, ch['FSC-A'], ch['FSC-H'], masks['cells'], 'main')
+                polygons['singlets'] = apply_learned_adj(poly, 'singlets')
+                masks['singlets'] = apply_gate(data, ch['FSC-A'], ch['FSC-H'], polygons['singlets'], masks['cells'])
             else:
-                poly2, conf2 = None, 0.0
-            polygons['singlets'], confidences['singlets'] = poly2, conf2
-            original['singlets'] = list(poly2) if poly2 else None
+                masks['singlets'] = masks['cells']
 
             # 3. Live
-            progress.progress(25, "Gate Live...")
+            progress.progress(15, "Live...")
             if ch['LiveDead']:
-                cells_m = apply_gate(data, ch['FSC-A'], ch['SSC-A'], polygons['cells'], None)
-                sing_m = apply_gate(data, ch['FSC-A'], ch['FSC-H'], polygons['singlets'], cells_m) if polygons['singlets'] else cells_m
-                poly3, conf3 = auto_gate_hexagon_robust(data, ch['LiveDead'], ch['SSC-A'], sing_m, 'low_x')
-                poly3 = apply_learned_adj(poly3, 'live')
+                poly, _ = auto_gate_hexagon(data, ch['LiveDead'], ch['SSC-A'], masks['singlets'], 'low_x')
+                polygons['live'] = apply_learned_adj(poly, 'live')
+                masks['live'] = apply_gate(data, ch['LiveDead'], ch['SSC-A'], polygons['live'], masks['singlets'])
             else:
-                poly3, conf3 = None, 0.0
-            polygons['live'], confidences['live'] = poly3, conf3
-            original['live'] = list(poly3) if poly3 else None
+                masks['live'] = masks['singlets']
 
-            # 4. hCD45+
-            progress.progress(35, "Gate hCD45+...")
+            # 4. Leucocytes (hCD45+)
+            progress.progress(25, "Leucocytes...")
             if ch['hCD45']:
-                cells_m = apply_gate(data, ch['FSC-A'], ch['SSC-A'], polygons['cells'], None)
-                sing_m = apply_gate(data, ch['FSC-A'], ch['FSC-H'], polygons['singlets'], cells_m) if polygons['singlets'] else cells_m
-                live_m = apply_gate(data, ch['LiveDead'], ch['SSC-A'], polygons['live'], sing_m) if polygons['live'] else sing_m
-                poly4, conf4 = auto_gate_hexagon_robust(data, ch['hCD45'], ch['SSC-A'], live_m, 'high_x')
-                poly4 = apply_learned_adj(poly4, 'hcd45')
+                poly, _ = auto_gate_hexagon(data, ch['hCD45'], ch['SSC-A'], masks['live'], 'high_x')
+                polygons['leucocytes'] = apply_learned_adj(poly, 'leucocytes')
+                masks['leucocytes'] = apply_gate(data, ch['hCD45'], ch['SSC-A'], polygons['leucocytes'], masks['live'])
             else:
-                poly4, conf4 = None, 0.0
-            polygons['hcd45'], confidences['hcd45'] = poly4, conf4
-            original['hcd45'] = list(poly4) if poly4 else None
+                masks['leucocytes'] = masks['live']
 
-            # Parent mask pour marqueurs
-            cells_m = apply_gate(data, ch['FSC-A'], ch['SSC-A'], polygons['cells'], None)
-            sing_m = apply_gate(data, ch['FSC-A'], ch['FSC-H'], polygons['singlets'], cells_m) if polygons['singlets'] else cells_m
-            live_m = apply_gate(data, ch['LiveDead'], ch['SSC-A'], polygons['live'], sing_m) if polygons['live'] else sing_m
-            hcd45_m = apply_gate(data, ch['hCD45'], ch['SSC-A'], polygons['hcd45'], live_m) if polygons['hcd45'] else live_m
-
-            # 5. CD3+
-            progress.progress(50, "Gate CD3+...")
+            # 5. T cells (CD3+)
+            progress.progress(35, "T cells...")
             if ch['CD3']:
-                poly5, conf5 = auto_gate_hexagon_robust(data, ch['CD3'], ch['SSC-A'], hcd45_m, 'high_x')
-                poly5 = apply_learned_adj(poly5, 'cd3')
+                poly, _ = auto_gate_hexagon(data, ch['CD3'], ch['SSC-A'], masks['leucocytes'], 'high_x')
+                polygons['tcells'] = apply_learned_adj(poly, 'tcells')
+                masks['tcells'] = apply_gate(data, ch['CD3'], ch['SSC-A'], polygons['tcells'], masks['leucocytes'])
             else:
-                poly5, conf5 = None, 0.0
-            polygons['cd3'], confidences['cd3'] = poly5, conf5
-            original['cd3'] = list(poly5) if poly5 else None
+                masks['tcells'] = masks['leucocytes']
 
-            # 6. CD19+
-            progress.progress(60, "Gate CD19+...")
+            # 6. B cells (CD19+)
+            progress.progress(45, "B cells...")
             if ch['CD19']:
-                poly6, conf6 = auto_gate_hexagon_robust(data, ch['CD19'], ch['SSC-A'], hcd45_m, 'high_x')
-                poly6 = apply_learned_adj(poly6, 'cd19')
-            else:
-                poly6, conf6 = None, 0.0
-            polygons['cd19'], confidences['cd19'] = poly6, conf6
-            original['cd19'] = list(poly6) if poly6 else None
+                poly, _ = auto_gate_hexagon(data, ch['CD19'], ch['SSC-A'], masks['leucocytes'], 'high_x')
+                polygons['bcells'] = apply_learned_adj(poly, 'bcells')
+                masks['bcells'] = apply_gate(data, ch['CD19'], ch['SSC-A'], polygons['bcells'], masks['leucocytes'])
 
-            # CD3+ mask pour CD4/CD8
-            cd3_m = apply_gate(data, ch['CD3'], ch['SSC-A'], polygons['cd3'], hcd45_m) if polygons['cd3'] else hcd45_m
+            # 7. NK cells (CD56+ ou CD16+)
+            progress.progress(55, "NK cells...")
+            nk_ch = ch['CD56'] or ch['CD16']
+            if nk_ch:
+                poly, _ = auto_gate_hexagon(data, nk_ch, ch['SSC-A'], masks['leucocytes'], 'high_x')
+                polygons['nk'] = apply_learned_adj(poly, 'nk')
+                masks['nk'] = apply_gate(data, nk_ch, ch['SSC-A'], polygons['nk'], masks['leucocytes'])
 
-            # 7. CD4+
-            progress.progress(75, "Gate CD4+...")
+            # 8. CD4+ T cells
+            progress.progress(65, "CD4+ T cells...")
             if ch['CD4']:
-                poly7, conf7 = auto_gate_hexagon_robust(data, ch['CD4'], ch['SSC-A'], cd3_m, 'high_x')
-                poly7 = apply_learned_adj(poly7, 'cd4')
-            else:
-                poly7, conf7 = None, 0.0
-            polygons['cd4'], confidences['cd4'] = poly7, conf7
-            original['cd4'] = list(poly7) if poly7 else None
+                poly, _ = auto_gate_hexagon(data, ch['CD4'], ch['SSC-A'], masks['tcells'], 'high_x')
+                polygons['cd4'] = apply_learned_adj(poly, 'cd4')
+                masks['cd4'] = apply_gate(data, ch['CD4'], ch['SSC-A'], polygons['cd4'], masks['tcells'])
 
-            # 8. CD8+
-            progress.progress(90, "Gate CD8+...")
+            # 9. CD8+ T cells
+            progress.progress(70, "CD8+ T cells...")
             if ch['CD8']:
-                poly8, conf8 = auto_gate_hexagon_robust(data, ch['CD8'], ch['SSC-A'], cd3_m, 'high_x')
-                poly8 = apply_learned_adj(poly8, 'cd8')
-            else:
-                poly8, conf8 = None, 0.0
-            polygons['cd8'], confidences['cd8'] = poly8, conf8
-            original['cd8'] = list(poly8) if poly8 else None
+                poly, _ = auto_gate_hexagon(data, ch['CD8'], ch['SSC-A'], masks['tcells'], 'high_x')
+                polygons['cd8'] = apply_learned_adj(poly, 'cd8')
+                masks['cd8'] = apply_gate(data, ch['CD8'], ch['SSC-A'], polygons['cd8'], masks['tcells'])
+
+            # 10. Daudi (cellules cibles)
+            progress.progress(75, "Daudi...")
+            if ch['Daudi']:
+                poly, _ = auto_gate_hexagon(data, ch['Daudi'], ch['SSC-A'], masks['live'], 'high_x')
+                polygons['daudi'] = apply_learned_adj(poly, 'daudi')
+                masks['daudi'] = apply_gate(data, ch['Daudi'], ch['SSC-A'], polygons['daudi'], masks['live'])
+
+            # Thresholds pour marqueurs
+            progress.progress(85, "Calcul seuils marqueurs...")
+            if ch['hPDL1']:
+                thresholds['hPDL1'] = auto_find_threshold(data, ch['hPDL1'], masks.get('leucocytes'))
+            if ch['hPD1']:
+                thresholds['hPD1'] = auto_find_threshold(data, ch['hPD1'], masks.get('tcells'))
+            if ch['CD16']:
+                thresholds['hCD16'] = auto_find_threshold(data, ch['CD16'], masks.get('nk') or masks.get('leucocytes'))
+            if ch['GranzymeB']:
+                thresholds['GranzymeB'] = auto_find_threshold(data, ch['GranzymeB'], masks.get('nk') or masks.get('tcells'))
 
             progress.progress(100, "Terminé!")
             st.session_state.auto_done = True
             st.rerun()
 
-    # AFFICHAGE DES GATES
+    # AFFICHAGE
     if st.session_state.auto_done:
         polygons = st.session_state.polygons
-        confidences = st.session_state.confidences
+        masks = st.session_state.masks
+        thresholds = st.session_state.thresholds
 
         # Recalcul des masques
-        cells_m = apply_gate(data, ch['FSC-A'], ch['SSC-A'], polygons.get('cells'), None)
-        sing_m = apply_gate(data, ch['FSC-A'], ch['FSC-H'], polygons.get('singlets'), cells_m) if polygons.get('singlets') else cells_m
-        live_m = apply_gate(data, ch['LiveDead'], ch['SSC-A'], polygons.get('live'), sing_m) if polygons.get('live') else sing_m
-        hcd45_m = apply_gate(data, ch['hCD45'], ch['SSC-A'], polygons.get('hcd45'), live_m) if polygons.get('hcd45') else live_m
-        cd3_m = apply_gate(data, ch['CD3'], ch['SSC-A'], polygons.get('cd3'), hcd45_m) if polygons.get('cd3') else hcd45_m
+        masks['cells'] = apply_gate(data, ch['FSC-A'], ch['SSC-A'], polygons.get('cells'), None)
+        masks['singlets'] = apply_gate(data, ch['FSC-A'], ch['FSC-H'], polygons.get('singlets'), masks['cells']) if ch['FSC-H'] else masks['cells']
+        masks['live'] = apply_gate(data, ch['LiveDead'], ch['SSC-A'], polygons.get('live'), masks['singlets']) if ch['LiveDead'] else masks['singlets']
+        masks['leucocytes'] = apply_gate(data, ch['hCD45'], ch['SSC-A'], polygons.get('leucocytes'), masks['live']) if ch['hCD45'] else masks['live']
+        masks['tcells'] = apply_gate(data, ch['CD3'], ch['SSC-A'], polygons.get('tcells'), masks['leucocytes']) if ch['CD3'] else masks['leucocytes']
 
-        # Configuration de tous les gates
-        all_gates = [
-            ('cells', 'Cells', ch['FSC-A'], ch['SSC-A'], 'FSC-A', 'SSC-A', 'Ungated → Cells', None),
-            ('singlets', 'Singlets', ch['FSC-A'], ch['FSC-H'], 'FSC-A', 'FSC-H', 'Cells → Singlets', cells_m),
-            ('live', 'Live', ch['LiveDead'], ch['SSC-A'], 'Live/Dead', 'SSC-A', 'Singlets → Live', sing_m),
-            ('hcd45', 'hCD45+', ch['hCD45'], ch['SSC-A'], 'hCD45', 'SSC-A', 'Live → hCD45+', live_m),
-            ('cd3', 'CD3+', ch['CD3'], ch['SSC-A'], 'CD3', 'SSC-A', 'hCD45+ → CD3+', hcd45_m),
-            ('cd19', 'CD19+', ch['CD19'], ch['SSC-A'], 'CD19', 'SSC-A', 'hCD45+ → CD19+', hcd45_m),
-            ('cd4', 'CD4+', ch['CD4'], ch['SSC-A'], 'CD4', 'SSC-A', 'CD3+ → CD4+', cd3_m),
-            ('cd8', 'CD8+', ch['CD8'], ch['SSC-A'], 'CD8', 'SSC-A', 'CD3+ → CD8+', cd3_m),
-        ]
-
-        # Filtrer les gates avec canaux disponibles
-        valid_gates = [(g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]) for g in all_gates if g[2] is not None and g[3] is not None]
-
-        # Tabs pour organisation
-        tab1, tab2, tab3 = st.tabs(["📊 Gates Individuels", "🗺️ Vue Récapitulative", "📥 Export"])
+        # Tabs
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Hiérarchie", "🧬 Populations", "💊 Marqueurs", "📥 Export"])
 
         with tab1:
-            stats = []
-            figures_data = []
+            st.markdown("### 🌳 Hiérarchie de Gating")
 
-            # Affichage en grille 2x4 ou 3x3
-            n_gates = len(valid_gates)
-            n_cols = 3
+            # Première ligne: Cells, Singlets, Live
+            cols = st.columns(3)
 
-            for row_start in range(0, n_gates, n_cols):
-                cols_display = st.columns(n_cols)
-                for col_idx in range(n_cols):
-                    gate_idx = row_start + col_idx
-                    if gate_idx >= n_gates:
-                        break
+            with cols[0]:
+                fig, n, pct, _ = create_flowjo_plot(
+                    data, ch['FSC-A'], ch['SSC-A'], 'FSC-A', 'SSC-A',
+                    'Cells', polygons.get('cells'), None, 'Cells', plot_type
+                )
+                st.plotly_chart(fig, use_container_width=True, key='p_cells')
 
-                    gkey, gname, x_ch, y_ch, x_label, y_label, title, parent_mask = valid_gates[gate_idx]
+            with cols[1]:
+                fig, n, pct, _ = create_flowjo_plot(
+                    data, ch['FSC-A'], ch['FSC-H'], 'FSC-A', 'FSC-H',
+                    'Singlets', polygons.get('singlets'), masks['cells'], 'Singlets', plot_type
+                )
+                st.plotly_chart(fig, use_container_width=True, key='p_singlets')
 
-                    with cols_display[col_idx]:
-                        conf = confidences.get(gkey, 0)
-                        _, conf_icon = get_confidence_class(conf)
-                        st.markdown(f"**{gname}** {conf_icon}")
+            with cols[2]:
+                fig, n, pct, _ = create_flowjo_plot(
+                    data, ch['LiveDead'], ch['SSC-A'], 'Live/Dead', 'SSC-A',
+                    'Live', polygons.get('live'), masks['singlets'], 'Live', plot_type
+                )
+                st.plotly_chart(fig, use_container_width=True, key='p_live')
 
-                        fig, n_in, pct = create_plot(
-                            data, x_ch, y_ch, x_label, y_label, title,
-                            polygons.get(gkey), parent_mask, gname, conf, compact=True
-                        )
-                        st.plotly_chart(fig, use_container_width=True, key=f"chart_{gkey}")
+            # Deuxième ligne: Leucocytes, T cells, B cells
+            cols2 = st.columns(3)
 
-                        # Données pour export
-                        x, y = data[x_ch].values, data[y_ch].values
-                        mask = (parent_mask.values if parent_mask is not None else np.ones(len(data), dtype=bool)) & \
-                               np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
-                        n_parent = mask.sum()
-                        if n_parent > 0:
-                            xt, yt = biex(x[mask]), biex(y[mask])
-                            n_sample = min(5000, len(xt))
-                            idx = np.random.choice(len(xt), n_sample, replace=False) if len(xt) > n_sample else np.arange(len(xt))
-                            figures_data.append({
-                                'title': f"{gname} ({pct:.1f}%)",
-                                'xd': xt[idx], 'yd': yt[idx],
-                                'x_label': x_label, 'y_label': y_label,
-                                'polygon': polygons.get(gkey),
-                                'confidence': conf
-                            })
-                        else:
-                            figures_data.append({
-                                'title': gname, 'xd': None, 'yd': None,
-                                'x_label': x_label, 'y_label': y_label,
-                                'polygon': None, 'confidence': 0
-                            })
+            with cols2[0]:
+                fig, n, pct, _ = create_flowjo_plot(
+                    data, ch['hCD45'], ch['SSC-A'], 'hCD45', 'SSC-A',
+                    'Leucocytes (hCD45+)', polygons.get('leucocytes'), masks['live'], 'Leucocytes', plot_type
+                )
+                st.plotly_chart(fig, use_container_width=True, key='p_leuco')
 
-                        parent_name = title.split('→')[0].strip()
-                        stats.append((gname, parent_name, n_in, pct, conf, n_parent))
+            with cols2[1]:
+                fig, n, pct, _ = create_flowjo_plot(
+                    data, ch['CD3'], ch['SSC-A'], 'CD3', 'SSC-A',
+                    'T cells (CD3+)', polygons.get('tcells'), masks['leucocytes'], 'T cells', plot_type
+                )
+                st.plotly_chart(fig, use_container_width=True, key='p_tcells')
 
-                        # Éditeur
-                        poly = polygons.get(gkey)
-                        if poly:
-                            with st.expander(f"✏️ Modifier", expanded=False):
-                                new_poly = render_point_editor(gkey, poly, gname)
-                                if new_poly is not None:
-                                    st.session_state.polygons[gkey] = new_poly
-                                    st.session_state.confidences[gkey] = compute_gate_confidence(data, new_poly, x_ch, y_ch, parent_mask)
-                                    st.rerun()
-
-            st.session_state.figures_data = figures_data
-
-            st.markdown("---")
-
-            # Actions
-            col_a, col_b, col_c = st.columns(3)
-            with col_a:
-                if st.button("💾 Sauvegarder apprentissage", type="primary", use_container_width=True):
-                    n_saved = 0
-                    for gname in polygons:
-                        curr = polygons.get(gname)
-                        orig = st.session_state.original_polygons.get(gname)
-                        conf = confidences.get(gname)
-                        if curr and orig and str(curr) != str(orig):
-                            update_learned_params(gname, orig, curr, conf)
-                            n_saved += 1
-                    st.success(f"✅ {n_saved} correction(s)") if n_saved else st.info("Aucune modif")
-
-            with col_b:
-                if st.button("🔃 Reset tous les gates", use_container_width=True):
-                    st.session_state.polygons = {k: list(v) if v else None for k, v in st.session_state.original_polygons.items()}
-                    st.rerun()
-
-            with col_c:
-                if st.button("🔄 Rafraîchir", use_container_width=True):
-                    st.rerun()
-
-            # Tableau résumé
-            st.markdown("### 📊 Statistiques")
-            df = pd.DataFrame(stats, columns=['Population', 'Parent', 'Count', '% Parent', 'Confiance', 'N_Parent'])
-            df['% Total'] = (df['Count'] / n_total * 100).round(2)
-            df['% Parent'] = df['% Parent'].round(1)
-            df['Confiance'] = df['Confiance'].round(0).astype(int).astype(str) + '%'
-            st.dataframe(df[['Population', 'Parent', 'Count', '% Parent', '% Total', 'Confiance']],
-                        use_container_width=True, hide_index=True)
+            with cols2[2]:
+                fig, n, pct, _ = create_flowjo_plot(
+                    data, ch['CD19'], ch['SSC-A'], 'CD19', 'SSC-A',
+                    'B cells (CD19+)', polygons.get('bcells'), masks['leucocytes'], 'B cells', plot_type
+                )
+                st.plotly_chart(fig, use_container_width=True, key='p_bcells')
 
         with tab2:
-            st.markdown("### 🗺️ Vue Récapitulative de Tous les Gates")
+            st.markdown("### 🧬 Sous-populations")
 
-            if st.session_state.figures_data:
-                summary_fig = create_summary_figure(st.session_state.figures_data, reader.filename)
-                st.plotly_chart(summary_fig, use_container_width=True)
+            cols = st.columns(3)
 
-            # Hiérarchie des gates
-            st.markdown("### 🌳 Hiérarchie du Gating")
-            hierarchy = """
-            ```
-            📁 All Events
-            └── 🔵 Cells (FSC-A vs SSC-A)
-                └── 🔵 Singlets (FSC-A vs FSC-H)
-                    └── 🟢 Live (LiveDead vs SSC-A)
-                        └── 🟣 hCD45+ (hCD45 vs SSC-A)
-                            ├── 🔴 CD3+ T cells (CD3 vs SSC-A)
-                            │   ├── 🟠 CD4+ Helper T (CD4 vs SSC-A)
-                            │   └── 🟡 CD8+ Cytotoxic T (CD8 vs SSC-A)
-                            └── 🔵 CD19+ B cells (CD19 vs SSC-A)
-            ```
-            """
-            st.markdown(hierarchy)
+            # NK cells
+            with cols[0]:
+                nk_ch = ch['CD56'] or ch['CD16']
+                if nk_ch:
+                    fig, n, pct, _ = create_flowjo_plot(
+                        data, nk_ch, ch['SSC-A'], 'CD56/CD16', 'SSC-A',
+                        'NK cells', polygons.get('nk'), masks['leucocytes'], 'NK', plot_type
+                    )
+                    st.plotly_chart(fig, use_container_width=True, key='p_nk')
+
+            # CD4+ T cells
+            with cols[1]:
+                if ch['CD4']:
+                    fig, n, pct, _ = create_flowjo_plot(
+                        data, ch['CD4'], ch['SSC-A'], 'CD4', 'SSC-A',
+                        'CD4+ T cells', polygons.get('cd4'), masks['tcells'], 'CD4+', plot_type
+                    )
+                    st.plotly_chart(fig, use_container_width=True, key='p_cd4')
+
+            # CD8+ T cells
+            with cols[2]:
+                if ch['CD8']:
+                    fig, n, pct, _ = create_flowjo_plot(
+                        data, ch['CD8'], ch['SSC-A'], 'CD8', 'SSC-A',
+                        'CD8+ T cells', polygons.get('cd8'), masks['tcells'], 'CD8+', plot_type
+                    )
+                    st.plotly_chart(fig, use_container_width=True, key='p_cd8')
+
+            # Daudi et mCD45
+            cols2 = st.columns(3)
+
+            with cols2[0]:
+                if ch['Daudi']:
+                    fig, n, pct, _ = create_flowjo_plot(
+                        data, ch['Daudi'], ch['SSC-A'], 'Daudi', 'SSC-A',
+                        'Daudi (cibles)', polygons.get('daudi'), masks['live'], 'Daudi', plot_type
+                    )
+                    st.plotly_chart(fig, use_container_width=True, key='p_daudi')
+
+            with cols2[1]:
+                if ch['mCD45']:
+                    fig, n, pct, _ = create_flowjo_plot(
+                        data, ch['mCD45'], ch['SSC-A'], 'mCD45', 'SSC-A',
+                        'mCD45+', None, masks['live'], 'mCD45', plot_type
+                    )
+                    st.plotly_chart(fig, use_container_width=True, key='p_mcd45')
+
+            # CD4 vs CD8 avec quadrants
+            with cols2[2]:
+                if ch['CD4'] and ch['CD8']:
+                    cd4_thresh = thresholds.get('CD4', auto_find_threshold(data, ch['CD4'], masks['tcells']))
+                    cd8_thresh = thresholds.get('CD8', auto_find_threshold(data, ch['CD8'], masks['tcells']))
+
+                    quad_lines = (cd4_thresh, cd8_thresh) if show_quadrants else None
+                    fig, n, pct, qstats = create_flowjo_plot(
+                        data, ch['CD4'], ch['CD8'], 'CD4', 'CD8',
+                        'CD4 vs CD8', None, masks['tcells'], '', plot_type, quad_lines
+                    )
+                    st.plotly_chart(fig, use_container_width=True, key='p_cd4cd8')
 
         with tab3:
-            st.markdown("### 📥 Export des Données et Graphiques")
+            st.markdown("### 💊 Analyse des Marqueurs")
 
-            # Export données
-            st.markdown("#### 📊 Données")
-            col1, col2 = st.columns(2)
+            marker_results = []
 
-            export_df = df.drop('Confiance', axis=1) if 'df' in dir() else pd.DataFrame()
-            col1.download_button(
-                "📥 Statistiques CSV",
-                export_df.to_csv(index=False) if len(export_df) > 0 else "",
-                f"{reader.filename}_stats.csv",
-                "text/csv",
-                use_container_width=True
-            )
+            # hPDL1
+            if ch['hPDL1']:
+                stats = calculate_marker_stats(data, ch['hPDL1'], masks.get('leucocytes'), thresholds.get('hPDL1'))
+                if stats:
+                    marker_results.append({
+                        'Marqueur': 'hPDL1',
+                        'Population': 'Leucocytes',
+                        '% Positif': f"{stats['pct_positive']:.1f}%",
+                        'MFI (total)': f"{stats['mfi_all']:.0f}",
+                        'MFI (pos)': f"{stats['mfi_positive']:.0f}",
+                        'N positifs': stats['n_positive']
+                    })
 
-            buf = io.BytesIO()
-            if len(export_df) > 0:
-                export_df.to_excel(buf, index=False, engine='openpyxl')
-            buf.seek(0)
-            col2.download_button(
-                "📥 Statistiques Excel",
-                buf.getvalue(),
-                f"{reader.filename}_stats.xlsx",
-                use_container_width=True
-            )
+            # hPD1
+            if ch['hPD1']:
+                stats = calculate_marker_stats(data, ch['hPD1'], masks.get('tcells'), thresholds.get('hPD1'))
+                if stats:
+                    marker_results.append({
+                        'Marqueur': 'hPD1',
+                        'Population': 'T cells',
+                        '% Positif': f"{stats['pct_positive']:.1f}%",
+                        'MFI (total)': f"{stats['mfi_all']:.0f}",
+                        'MFI (pos)': f"{stats['mfi_positive']:.0f}",
+                        'N positifs': stats['n_positive']
+                    })
 
-            # Export graphiques
-            st.markdown("#### 🖼️ Graphiques")
-            st.info("💡 Pour exporter les graphiques, utilisez le menu Plotly (icône appareil photo) sur chaque graphique, ou exportez la vue récapitulative ci-dessous.")
+            # hCD16
+            if ch['CD16']:
+                parent = masks.get('nk') or masks.get('leucocytes')
+                stats = calculate_marker_stats(data, ch['CD16'], parent, thresholds.get('hCD16'))
+                if stats:
+                    marker_results.append({
+                        'Marqueur': 'hCD16',
+                        'Population': 'NK/Leucocytes',
+                        '% Positif': f"{stats['pct_positive']:.1f}%",
+                        'MFI (total)': f"{stats['mfi_all']:.0f}",
+                        'MFI (pos)': f"{stats['mfi_positive']:.0f}",
+                        'N positifs': stats['n_positive']
+                    })
 
-            # Export figure récapitulative
-            if st.session_state.figures_data:
-                summary_fig = create_summary_figure(st.session_state.figures_data, reader.filename)
+            # Granzyme B
+            if ch['GranzymeB']:
+                parent = masks.get('nk') or masks.get('tcells') or masks.get('leucocytes')
+                stats = calculate_marker_stats(data, ch['GranzymeB'], parent, thresholds.get('GranzymeB'))
+                if stats:
+                    marker_results.append({
+                        'Marqueur': 'Granzyme B+',
+                        'Population': 'NK/T cells',
+                        '% Positif': f"{stats['pct_positive']:.1f}%",
+                        'MFI (total)': f"{stats['mfi_all']:.0f}",
+                        'MFI (pos)': f"{stats['mfi_positive']:.0f}",
+                        'N positifs': stats['n_positive']
+                    })
 
-                col1, col2, col3 = st.columns(3)
+            if marker_results:
+                df_markers = pd.DataFrame(marker_results)
+                st.dataframe(df_markers, use_container_width=True, hide_index=True)
 
-                # HTML interactif
-                html_buffer = io.StringIO()
-                summary_fig.write_html(html_buffer, include_plotlyjs='cdn')
-                html_bytes = html_buffer.getvalue().encode()
+                # Visualisation des marqueurs avec quadrants
+                st.markdown("#### 📊 Quadrant Analysis")
+
+                cols = st.columns(2)
+
+                # PD1 vs PDL1
+                if ch['hPD1'] and ch['hPDL1']:
+                    with cols[0]:
+                        pd1_thresh = thresholds.get('hPD1', 0)
+                        pdl1_thresh = thresholds.get('hPDL1', 0)
+                        quad_lines = (pd1_thresh, pdl1_thresh) if show_quadrants else None
+
+                        fig, _, _, qstats = create_flowjo_plot(
+                            data, ch['hPD1'], ch['hPDL1'], 'hPD1', 'hPDL1',
+                            'PD1 vs PDL1', None, masks.get('tcells'), '', plot_type, quad_lines
+                        )
+                        st.plotly_chart(fig, use_container_width=True, key='p_pd1pdl1')
+
+                        if qstats:
+                            st.markdown(f"""
+                            **Quadrants:**
+                            - PD1+ PDL1+: {qstats['UR']['pct']:.1f}%
+                            - PD1+ PDL1-: {qstats['LR']['pct']:.1f}%
+                            - PD1- PDL1+: {qstats['UL']['pct']:.1f}%
+                            - PD1- PDL1-: {qstats['LL']['pct']:.1f}%
+                            """)
+
+                # CD16 vs Granzyme B
+                if ch['CD16'] and ch['GranzymeB']:
+                    with cols[1]:
+                        cd16_thresh = thresholds.get('hCD16', 0)
+                        grzb_thresh = thresholds.get('GranzymeB', 0)
+                        quad_lines = (cd16_thresh, grzb_thresh) if show_quadrants else None
+
+                        fig, _, _, qstats = create_flowjo_plot(
+                            data, ch['CD16'], ch['GranzymeB'], 'CD16', 'Granzyme B',
+                            'CD16 vs Granzyme B', None, masks.get('nk') or masks.get('leucocytes'), '', plot_type, quad_lines
+                        )
+                        st.plotly_chart(fig, use_container_width=True, key='p_cd16grzb')
+
+                        if qstats:
+                            st.markdown(f"""
+                            **Quadrants:**
+                            - CD16+ GrzB+: {qstats['UR']['pct']:.1f}%
+                            - CD16+ GrzB-: {qstats['LR']['pct']:.1f}%
+                            - CD16- GrzB+: {qstats['UL']['pct']:.1f}%
+                            - CD16- GrzB-: {qstats['LL']['pct']:.1f}%
+                            """)
+            else:
+                st.info("Aucun marqueur fonctionnel détecté dans les canaux")
+
+        with tab4:
+            st.markdown("### 📥 Export")
+
+            # Statistiques des populations
+            pop_stats = []
+            pop_names = ['cells', 'singlets', 'live', 'leucocytes', 'tcells', 'bcells', 'nk', 'cd4', 'cd8', 'daudi']
+            pop_labels = ['Cells', 'Singlets', 'Live', 'Leucocytes (hCD45+)', 'T cells (CD3+)',
+                         'B cells (CD19+)', 'NK cells', 'CD4+ T', 'CD8+ T', 'Daudi']
+
+            for pname, plabel in zip(pop_names, pop_labels):
+                if pname in masks:
+                    n = masks[pname].sum()
+                    pct_total = n / n_total * 100
+                    pop_stats.append({
+                        'Population': plabel,
+                        'Count': n,
+                        '% Total': f"{pct_total:.2f}%"
+                    })
+
+            if pop_stats:
+                df_pop = pd.DataFrame(pop_stats)
+                st.dataframe(df_pop, use_container_width=True, hide_index=True)
+
+                col1, col2 = st.columns(2)
                 col1.download_button(
-                    "📥 HTML Interactif",
-                    html_bytes,
-                    f"{reader.filename}_summary.html",
-                    "text/html",
-                    use_container_width=True
+                    "📥 Populations CSV",
+                    df_pop.to_csv(index=False),
+                    f"{reader.filename}_populations.csv",
+                    "text/csv", use_container_width=True
                 )
 
-                # JSON (pour réimport)
-                json_str = summary_fig.to_json()
-                col2.download_button(
-                    "📥 JSON (Plotly)",
-                    json_str,
-                    f"{reader.filename}_summary.json",
-                    "application/json",
-                    use_container_width=True
-                )
-
-                # PNG (si kaleido disponible)
-                try:
-                    png_bytes = summary_fig.to_image(format='png', width=1600, height=1200, scale=2)
-                    col3.download_button(
-                        "📥 PNG (Image)",
-                        png_bytes,
-                        f"{reader.filename}_summary.png",
-                        "image/png",
-                        use_container_width=True
+                if marker_results:
+                    df_markers = pd.DataFrame(marker_results)
+                    col2.download_button(
+                        "📥 Marqueurs CSV",
+                        df_markers.to_csv(index=False),
+                        f"{reader.filename}_markers.csv",
+                        "text/csv", use_container_width=True
                     )
-                except Exception as e:
-                    col3.warning("PNG: installez kaleido")
-
-                # Export individuel
-                st.markdown("#### 📁 Export Individuel des Gates")
-
-                gate_to_export = st.selectbox(
-                    "Sélectionner un gate",
-                    [g[1] for g in valid_gates],
-                    key="gate_export_select"
-                )
-
-                # Trouver le gate
-                for gkey, gname, x_ch, y_ch, x_label, y_label, title, parent_mask in valid_gates:
-                    if gname == gate_to_export:
-                        fig_single, _, _ = create_plot(
-                            data, x_ch, y_ch, x_label, y_label, title,
-                            polygons.get(gkey), parent_mask, gname,
-                            confidences.get(gkey, 0), compact=False
-                        )
-
-                        col1, col2 = st.columns(2)
-
-                        html_buf = io.StringIO()
-                        fig_single.write_html(html_buf, include_plotlyjs='cdn')
-                        col1.download_button(
-                            f"📥 {gname} HTML",
-                            html_buf.getvalue().encode(),
-                            f"{reader.filename}_{gkey}.html",
-                            "text/html",
-                            use_container_width=True
-                        )
-
-                        try:
-                            png_single = fig_single.to_image(format='png', width=1000, height=800, scale=2)
-                            col2.download_button(
-                                f"📥 {gname} PNG",
-                                png_single,
-                                f"{reader.filename}_{gkey}.png",
-                                "image/png",
-                                use_container_width=True
-                            )
-                        except:
-                            col2.info("PNG: kaleido requis")
-
-                        break
 
 else:
     st.markdown("""
-    <div class="info-box">
-    <h3>🔬 FACS Complete Gating v6</h3>
-    <ul>
-    <li>🎯 <b>8 Gates complets</b>: Cells, Singlets, Live, hCD45, CD3, CD19, CD4, CD8</li>
-    <li>📊 <b>Vue récapitulative</b>: Tous les gates en une seule figure</li>
-    <li>📥 <b>Export multi-format</b>: PNG, HTML, Excel, CSV</li>
-    <li>🧠 <b>Apprentissage</b>: Les corrections améliorent les futurs gatings</li>
-    </ul>
-    <p>Uploadez un fichier FCS pour commencer</p>
+    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 2rem; border-radius: 10px; text-align: center;">
+    <h2>🔬 FACS FlowJo Style v7</h2>
+    <p><b>Populations:</b> Cells, Singlets, Live, Leucocytes, T cells, B cells, NK, CD4+, CD8+, Daudi, mCD45</p>
+    <p><b>Marqueurs:</b> hPDL1, hPD1, hCD16, Granzyme B+</p>
+    <p><b>Visualisation:</b> Pseudo-color, Contour, Densité, Quadrants</p>
+    <br>
+    <p>📁 Uploadez un fichier FCS pour commencer</p>
     </div>
     """, unsafe_allow_html=True)
 
-st.caption(f"v6 | 🧠 {n_learned} corrections | Complete Gating + Export")
+st.caption("v7 | FlowJo Style | Complete Immune Phenotyping")
