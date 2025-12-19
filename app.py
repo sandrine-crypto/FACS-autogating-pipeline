@@ -707,9 +707,9 @@ if uploaded:
             if ch.get('hPD1'):
                 thresholds['hPD1'] = auto_find_threshold(data, ch.get('hPD1'), masks.get('tcells'))
             if ch.get('CD16'):
-                thresholds['hCD16'] = auto_find_threshold(data, ch.get('CD16'), masks.get('nk') or masks.get('leucocytes'))
+                thresholds['hCD16'] = auto_find_threshold(data, ch.get('CD16'), masks.get('nk') if 'nk' in masks else masks.get('leucocytes'))
             if ch.get('GranzymeB'):
-                thresholds['GranzymeB'] = auto_find_threshold(data, ch.get('GranzymeB'), masks.get('nk') or masks.get('tcells'))
+                thresholds['GranzymeB'] = auto_find_threshold(data, ch.get('GranzymeB'), masks.get('nk') if 'nk' in masks else masks.get('tcells'))
 
             progress.progress(100, "Terminé!")
             st.session_state.auto_done = True
@@ -880,7 +880,7 @@ if uploaded:
 
             # hCD16
             if ch.get('CD16'):
-                parent = masks.get('nk') or masks.get('leucocytes')
+                parent = masks.get('nk') if 'nk' in masks else masks.get('leucocytes')
                 stats = calculate_marker_stats(data, ch.get('CD16'), parent, thresholds.get('hCD16'))
                 if stats:
                     marker_results.append({
@@ -894,7 +894,7 @@ if uploaded:
 
             # Granzyme B
             if ch.get('GranzymeB'):
-                parent = masks.get('nk') or masks.get('tcells') or masks.get('leucocytes')
+                parent = masks.get('nk') if 'nk' in masks else (masks.get('tcells') if 'tcells' in masks else masks.get('leucocytes'))
                 stats = calculate_marker_stats(data, ch.get('GranzymeB'), parent, thresholds.get('GranzymeB'))
                 if stats:
                     marker_results.append({
@@ -946,7 +946,7 @@ if uploaded:
 
                         fig, _, _, qstats = create_flowjo_plot(
                             data, ch.get('CD16'), ch.get('GranzymeB'), 'CD16', 'Granzyme B',
-                            'CD16 vs Granzyme B', None, masks.get('nk') or masks.get('leucocytes'), '', plot_type, quad_lines
+                            'CD16 vs Granzyme B', None, masks.get('nk') if 'nk' in masks else masks.get('leucocytes'), '', plot_type, quad_lines
                         )
                         st.plotly_chart(fig, use_container_width=True, key='p_cd16grzb')
 
